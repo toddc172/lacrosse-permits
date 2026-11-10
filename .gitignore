@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+.dev.vars*
+.wrangler/
+node_modules/
+.venv/
+.private-work/
+source/
+uploads/
+*.pdf
+*.csv
+*.log
+state*.json
+settings.local.json
