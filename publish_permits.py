@@ -9,19 +9,25 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import gzip
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import unicodedata
+import zlib
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, build_opener
+from urllib.parse import urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from cloudflare_client import Cloudflare, MAX_VALUE, NoRedirect, ServiceError, json_bytes
 from permit_data import PARSER_VERSION, parse_report, public_dataset, validate_unique
@@ -120,6 +126,70 @@ def write_site(folder, data, html_path):
     (folder / "_headers").write_text(headers, encoding="utf-8")
 
 
+class PublicSiteRedirect(HTTPRedirectHandler):
+    """Public checks may follow HTTPS redirects within the same public host.
+
+    This handler is never used for the authenticated Cloudflare API client.
+    A redirect to a login service or another host cannot satisfy verification.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        destination = urljoin(req.full_url, newurl)
+        before, after = urlsplit(req.full_url), urlsplit(destination)
+        if (after.scheme != "https" or after.hostname != before.hostname
+                or after.port not in (None, 443) or after.username or after.password):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, destination)
+
+
+def strict_json(raw):
+    def pairs(items):
+        obj = {}
+        for key, value in items:
+            if key in obj:
+                raise ValueError("duplicate_json_key")
+            obj[key] = value
+        return obj
+
+    def invalid_constant(_):
+        raise ValueError("invalid_json_number")
+
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid_constant)
+
+
+def same_public_data(actual, expected):
+    # Static delivery can change insignificant JSON formatting or key order.
+    # Every field, record, timestamp and list order must still match.
+    if actual == expected:
+        return True
+    try:
+        return json_bytes(strict_json(actual)) == json_bytes(strict_json(expected))
+    except (ValueError, UnicodeError, TypeError, RecursionError):
+        return False
+
+
+def public_body(response):
+    raw = response.read(MAX_VALUE + 1)
+    if len(raw) > MAX_VALUE:
+        raise ServiceError("response_too_large")
+    encoding = getattr(response, "headers", {}).get("Content-Encoding", "identity").strip().lower()
+    try:
+        if encoding == "gzip":
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+                raw = stream.read(MAX_VALUE + 1)
+        elif encoding == "deflate":
+            decoder = zlib.decompressobj()
+            raw = decoder.decompress(raw, MAX_VALUE + 1)
+            if decoder.unconsumed_tail or not decoder.eof:
+                raise ServiceError("invalid_compressed_response")
+        elif encoding not in ("", "identity"):
+            raise ServiceError("unsupported_response_encoding")
+    except (OSError, EOFError, zlib.error):
+        raise ServiceError("invalid_compressed_response") from None
+    if len(raw) > MAX_VALUE:
+        raise ServiceError("response_too_large")
+    return raw
+
+
 class Pages:
     def __init__(self, api, project_name, *, sleep=time.sleep):
         self.api, self.project_name, self.sleep = api, project_name, sleep
@@ -146,21 +216,47 @@ class Pages:
         return "https://" + project["hostname"]
 
     def verify(self, hostname, expected):
+        if not re.fullmatch(r"[a-z0-9-]+\.pages\.dev", hostname):
+            raise ServiceError("invalid_public_hostname")
         digest = hashlib.sha256(expected).hexdigest()
         url = "https://" + hostname + "/permits.json?publish=" + digest
-        opener = build_opener(NoRedirect())
+        opener = build_opener(PublicSiteRedirect())
+        last_reason = "not_checked"
         for attempt in range(6):
             try:
-                req = Request(url, headers={"Cache-Control": "no-cache"})
+                req = Request(url, headers={"Cache-Control": "no-cache",
+                              "Accept": "application/json", "Accept-Encoding": "identity",
+                              "User-Agent": "LaCrosseTribune-Permits-Publisher/1.1"})
                 with opener.open(req, timeout=20) as response:
-                    raw = response.read(MAX_VALUE + 1)
-                if raw == expected:
+                    raw = public_body(response)
+                if same_public_data(raw, expected):
+                    print("Public-site verification passed.")
                     return
-            except (HTTPError, URLError, OSError, TimeoutError):
-                pass
+                try:
+                    strict_json(raw)
+                    last_reason = "different_public_data"
+                except (ValueError, UnicodeError, TypeError, RecursionError):
+                    last_reason = "response_is_not_valid_json"
+            except HTTPError as exc:
+                last_reason = f"http_{exc.code}"
+                exc.close()
+            except URLError as exc:
+                if isinstance(exc.reason, socket.gaierror):
+                    last_reason = "dns_lookup_failed"
+                elif isinstance(exc.reason, ssl.SSLError):
+                    last_reason = "tls_connection_failed"
+                else:
+                    last_reason = "network_request_failed"
+            except (OSError, TimeoutError):
+                last_reason = "network_request_failed"
+            except ServiceError as exc:
+                last_reason = exc.code
+            # Fixed classifications only: never log response bodies, credentials,
+            # cookies, source contents or raw exception strings.
+            print(f"Public-site verification {attempt + 1}/6: {last_reason}.", flush=True)
             if attempt < 5:
-                self.sleep(min(10, 2 ** attempt))
-        raise ServiceError("pages_production_verification_failed")
+                self.sleep(min(30, 5 * (2 ** attempt)))
+        raise ServiceError("pages_production_verification_failed_" + last_reason)
 
 
 def read_state(api):
