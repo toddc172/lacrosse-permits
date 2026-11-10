@@ -17,7 +17,7 @@ import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
 
-PARSER_VERSION = "1.0.0"
+PARSER_VERSION = "1.1.0"
 MUNICIPALITY_SOURCE = "https://www.revenue.wi.gov/Pages/UST/parcels.aspx"
 # Wisconsin Department of Revenue, La Crosse County parcel-prefix table.
 # Verified Nov. 9, 2026. Municipality is derived from the work parcel, never
@@ -192,6 +192,43 @@ def owner_name(cell):
     return clean(" ".join(name)) or None
 
 
+def county_page_tables(page, columns):
+    """Repair missing internal borders using this report's verified header.
+
+    Some M5 rows have one spanning cell where the vertical border segments
+    are missing. Reuse the 20 column boundaries from the exact supported
+    header, within the original table bounds. Summary tables are untouched.
+    No text or source values are inferred; reconciliation remains mandatory.
+    """
+    extracted = []
+    for found in page.find_tables():
+        table = found.extract()
+        if not table or len(table[0]) != 20:
+            extracted.append(table)
+            continue
+        for index, row in enumerate(table):
+            if clean(row[0]) == "Department":
+                if [clean(value) for value in row] != PDF_FIELDS:
+                    raise ValidationError("County PDF column layout changed")
+                boxes = found.rows[index].cells
+                if any(box is None for box in boxes):
+                    raise ValidationError("County header column boundaries are incomplete")
+                columns = sorted({x for box in boxes for x in (box[0], box[2])})
+                if len(columns) != 21:
+                    raise ValidationError("County header must define 20 columns")
+        if any(value is None for row in table for value in row):
+            if (columns is None or abs(found.bbox[0] - columns[0]) > 2
+                    or abs(found.bbox[2] - columns[-1]) > 2):
+                raise ValidationError("County table cannot be aligned with its verified header")
+            repaired = page.crop(found.bbox).extract_tables({
+                "vertical_strategy": "explicit", "explicit_vertical_lines": columns})
+            if len(repaired) != 1 or any(len(row) != 20 for row in repaired[0]):
+                raise ValidationError("County table border repair needs review")
+            table = repaired[0]
+        extracted.append(table)
+    return extracted, columns
+
+
 def parse_county_pdf(raw: bytes, source_name: str):
     prepared, removed = remove_clipped_header_wrappers(raw)
     rows, control, by_type = [], None, None
@@ -203,9 +240,12 @@ def parse_county_pdf(raw: bytes, source_name: str):
         if not period:
             raise ValidationError("County PDF lacks its reporting period")
         start, end = parse_date(period[1], True), parse_date(period[2], True)
-        saw_header = False
+        saw_header, columns = False, None
         for page_number, page in enumerate(doc.pages, 1):
-            for table in page.extract_tables():
+            tables, columns = county_page_tables(page, columns)
+            for table in tables:
+                if not table:
+                    continue
                 if len(table[0]) == 5 and clean(table[0][0]).lower() == "count by type":
                     by_type = {clean(row[0]): int(clean(row[1])) for row in table[2:]
                                if row[0] and clean(row[0]) != "Total:"}
@@ -227,7 +267,10 @@ def parse_county_pdf(raw: bytes, source_name: str):
                     if not any(clean(v) for v in row):
                         continue
                     if clean(row[3]):
-                        if not re.fullmatch(r"(?:ZO-\d{2}-\d+|CU-\d+|SA-\d{4}-\d+|STR\s+\d+)", clean(row[3])):
+                        # Preserve the source's identifier, including AGC agricultural
+                        # certificates and other year-number series in this county
+                        # report. Department, type summaries and totals still gate it.
+                        if not re.fullmatch(r"(?:[A-Z]{2,6}-\d{2}(?:\d{2})?-\d+|CU-\d+|STR\s+\d+)", clean(row[3])):
                             raise ValidationError("Unexpected county permit identifier")
                         if clean(row[0]) != "Zoning Department":
                             raise ValidationError("Unexpected county department")
