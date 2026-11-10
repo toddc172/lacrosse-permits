@@ -1,420 +1,366 @@
-"""Daily private-KV import -> validated static Pages deployment.
+"""Validated parsers for La Crosse city CSV and county M5 zoning PDF reports.
 
-Run exactly one publishing workflow, with concurrency cancellation disabled.
-KV has eventual consistency and is NOT a transactional lock or CAS store.
-No raw source is written to disk or to the public repository.
+No AI or OCR inference. Unknown layouts fail without changing the public dataset.
 """
 from __future__ import annotations
 
-import argparse
-import base64
-import copy
-import gzip
+import csv
 import hashlib
 import io
 import json
-import os
-from pathlib import Path
 import re
-import socket
-import ssl
-import subprocess
-import sys
-import tempfile
-import time
-import unicodedata
-import zlib
-from datetime import datetime, timezone
-from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from collections import Counter
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
 
-from cloudflare_client import Cloudflare, MAX_VALUE, NoRedirect, ServiceError, json_bytes
-from permit_data import PARSER_VERSION, parse_report, public_dataset, validate_unique
+import pdfplumber
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ContentStream
 
-STATE_KEY = "state:current"
-STATUS_KEY = "control:status"
-MAX_SOURCE = 2 * 1024 * 1024
-WRANGLER = "4.159.0"
-HEX = re.compile(r"[0-9a-f]{64}")
-PUBLIC_KEYS = {"schema_version", "generated_at", "last_checked_at", "latest_issue_date",
-               "record_count", "source_count", "records", "municipality_source",
-               "methodology", "import_status"}
+PARSER_VERSION = "1.1.0"
+MUNICIPALITY_SOURCE = "https://www.revenue.wi.gov/Pages/UST/parcels.aspx"
+# Wisconsin Department of Revenue, La Crosse County parcel-prefix table.
+# Verified Nov. 9, 2026. Municipality is derived from the work parcel, never
+# from the owner's mailing address or the contractor's address.
+MUNICIPALITIES = {
+    1: "Town of Bangor", 2: "Town of Barre", 3: "Town of Burns",
+    4: "Town of Campbell", 5: "Town of Farmington", 6: "Town of Greenfield",
+    7: "Town of Hamilton", 8: "Town of Holland", 9: "Town of Medary",
+    10: "Town of Onalaska", 11: "Town of Shelby", 12: "Town of Washington",
+    13: "Village of Bangor", 14: "Village of Holmen", 15: "Village of Rockland",
+    16: "Village of West Salem", 17: "City of La Crosse", 18: "City of Onalaska",
+}
+CSV_FIELDS = [
+    "PermitNumber", "PermitType", "PermitWorkClass", "ProjectCost",
+    "ProjectDescription", "ParcelNumber", "PermitAddress", "Owner",
+    "Contractor", "PermitApplyDate", "PermitIssueDate",
+]
+PDF_FIELDS = [
+    "Department", "Application Date", "Permit Date", "Permit Number",
+    "Permit Type", "Permit Status", "Parcel Owner", "Work Printkey / Address",
+    "Use Group", "Company", "Contractor", "Work Description", "Fee Total",
+    "Cost of Construction", "Sq Footage", "Expiration Date", "Days Inactive",
+    "Parcel Zone", "Flood Zone", "Flags",
+]
+PUBLIC_FIELDS = {
+    "id", "jurisdiction", "category", "permit_number", "permit_type",
+    "work_class", "issued_date", "application_date", "status", "address",
+    "municipality", "municipality_method", "parcel", "owner", "contractor",
+    "company", "description", "project_cost_cents", "fee_cents",
+    "source_file", "source_pages", "report_start", "report_end", "notes",
+}
 
 
-def utc(value):
+class ValidationError(ValueError):
+    pass
+
+
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def parse_date(value, required=False):
+    value = clean(value)
+    if not value and not required:
+        return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            raise ValueError()
-        return parsed.astimezone(timezone.utc)
-    except (AttributeError, ValueError, TypeError):
-        raise ServiceError("invalid_source_timestamp") from None
+        return datetime.strptime(value, "%m/%d/%Y").date().isoformat()
+    except ValueError as exc:
+        raise ValidationError(f"Invalid date: {value!r}") from exc
 
 
-def upload_metadata(item):
-    if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
-        raise ServiceError("invalid_upload_metadata")
-    meta = item["metadata"]
-    expected = {"schema_version", "id", "name", "bytes", "sha256", "uploaded_at", "media_type"}
-    if set(meta) != expected or meta.get("schema_version") != 1:
-        raise ServiceError("invalid_upload_metadata")
-    ident, name, digest = meta["id"], meta["name"], meta["sha256"]
-    if not all(isinstance(s, str) for s in (ident, name, digest)):
-        raise ServiceError("invalid_upload_metadata")
-    if not HEX.fullmatch(ident) or not HEX.fullmatch(digest) or item.get("name") != "uploads/" + ident:
-        raise ServiceError("invalid_upload_metadata")
-    if (not name or len(name.encode("utf-8")) > 220 or name != unicodedata.normalize("NFC", name).strip()
-            or re.search(r"[/\\\x00-\x1f\x7f]", name)):
-        raise ServiceError("invalid_upload_filename")
-    suffix = Path(name).suffix.lower()
-    if suffix not in (".csv", ".pdf") or meta["media_type"] != {".csv": "text/csv", ".pdf": "application/pdf"}[suffix]:
-        raise ServiceError("invalid_upload_type")
-    if type(meta["bytes"]) is not int or not 0 < meta["bytes"] <= MAX_SOURCE:
-        raise ServiceError("invalid_upload_size")
-    if hashlib.sha256((name + "\n" + digest).encode()).hexdigest() != ident:
-        raise ServiceError("invalid_upload_identity")
-    utc(meta["uploaded_at"])
-    return copy.deepcopy(meta)
-
-
-def validate_public(data):
-    if (not isinstance(data, dict) or set(data) - PUBLIC_KEYS or data.get("schema_version") != 1
-            or not isinstance(data.get("records"), list)
-            or data.get("record_count") != len(data["records"])):
-        raise ServiceError("invalid_public_dataset")
+def cents(value):
+    value = clean(value)
+    if not value:
+        return None
+    if not re.fullmatch(r"\$?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{1,2})?", value):
+        raise ValidationError(f"Invalid money value: {value!r}")
     try:
-        validate_unique(data["records"])
-    except Exception:
-        raise ServiceError("public_field_validation_failed") from None
-    if len(json_bytes(data)) > MAX_VALUE:
-        raise ServiceError("public_dataset_capacity")
+        return int(Decimal(value.replace("$", "").replace(",", "")) * 100)
+    except InvalidOperation as exc:
+        raise ValidationError(f"Invalid money value: {value!r}") from exc
 
 
-def initial_dataset():
-    result = public_dataset({}, generated_at="1970-01-01T00:00:00Z")
-    result.update(generated_at=None, last_checked_at=None, import_status="awaiting_initial_import")
-    return result
+def municipality(parcel):
+    match = re.fullmatch(r"(\d{1,3})-\d{5}-\d{1,3}", parcel)
+    if not match or int(match[1]) not in MUNICIPALITIES:
+        raise ValidationError(f"Unrecognized La Crosse County parcel: {parcel!r}")
+    return MUNICIPALITIES[int(match[1])]
 
 
-def write_site(folder, data, html_path):
-    """Allowlist the entire deployment. Never recursively copy a work directory."""
-    validate_public(data)
-    folder = Path(folder)
-    folder.mkdir(parents=True, exist_ok=True)
-    if any(folder.iterdir()):
-        raise ServiceError("site_directory_must_be_empty")
-    html = Path(html_path).read_text(encoding="utf-8")
-    if 'id="preview-data"' in html:
-        raise ServiceError("preview_data_in_production_html")
-    scripts = re.findall(r"<script>([\s\S]*?)</script>", html)
-    if len(scripts) != 1 or re.search(r"<script[^>]+src=", html, re.I):
-        raise ServiceError("unexpected_production_script")
-    script_hash = base64.b64encode(hashlib.sha256(scripts[0].encode()).digest()).decode()
-    headers = ("/*\n"
-               "  Content-Security-Policy: default-src 'none'; script-src 'sha256-" + script_hash +
-               "'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; "
-               "font-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; "
-               "frame-ancestors 'self' https://lacrossetribune.com https://*.lacrossetribune.com\n"
-               "  X-Content-Type-Options: nosniff\n"
-               "  Referrer-Policy: no-referrer\n"
-               "  Permissions-Policy: camera=(), microphone=(), geolocation=()\n"
-               "  Cache-Control: no-cache\n\n"
-               "/permits.json\n  Cache-Control: no-store\n")
-    (folder / "index.html").write_text(html, encoding="utf-8")
-    (folder / "permits.json").write_bytes(json_bytes(data))
-    (folder / "_headers").write_text(headers, encoding="utf-8")
+def base_record(jurisdiction, number, parcel, source_name):
+    if not number:
+        raise ValidationError("Missing permit number")
+    return {
+        "id": f"{jurisdiction}:{number.upper()}", "jurisdiction": jurisdiction,
+        "permit_number": number, "parcel": parcel,
+        "municipality": municipality(parcel), "municipality_method": "Work parcel prefix",
+        "source_file": source_name, "source_pages": [], "notes": [],
+        "owner": None, "contractor": None, "company": None, "work_class": None,
+        "fee_cents": None, "report_start": None, "report_end": None,
+    }
 
 
-class PublicSiteRedirect(HTTPRedirectHandler):
-    """Public checks may follow HTTPS redirects within the same public host.
+def parse_city_csv(raw: bytes, source_name: str):
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValidationError("Building CSV must use UTF-8 encoding") from exc
+    reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)
+    if reader.fieldnames != CSV_FIELDS:
+        raise ValidationError("Building CSV headers changed; review the parser")
+    records = []
+    for line_number, row in enumerate(reader, 2):
+        if None in row or any(value is None for value in row.values()):
+            raise ValidationError(f"Malformed CSV record near row {line_number}")
+        row = {key: clean(value) for key, value in row.items()}
+        if not any(row.values()):
+            continue
+        r = base_record("city-building", row["PermitNumber"], row["ParcelNumber"], source_name)
+        if r["municipality"] != "City of La Crosse":
+            raise ValidationError("City building CSV contains a parcel outside La Crosse")
+        if not row["PermitType"].startswith("Building - ") or not row["PermitAddress"]:
+            raise ValidationError(f"Missing or unexpected building fields for {r['permit_number']}")
+        r.update({
+            "category": "Building", "permit_type": row["PermitType"],
+            "work_class": row["PermitWorkClass"] or None,
+            "project_cost_cents": cents(row["ProjectCost"]),
+            "description": row["ProjectDescription"], "address": row["PermitAddress"],
+            "owner": row["Owner"] or None, "contractor": row["Contractor"] or None,
+            "application_date": parse_date(row["PermitApplyDate"]),
+            "issued_date": parse_date(row["PermitIssueDate"], required=True),
+            # The city CSV contains an issue date, but no current-status column.
+            "status": None,
+        })
+        if not re.match(r"\d", r["address"]):
+            r["notes"].append("The source does not supply a street number.")
+        records.append(r)
+    if not records:
+        raise ValidationError("Building CSV has no permit rows; review before removing records")
+    dates = [r["issued_date"] for r in records]
+    for r in records:
+        r.update(report_start=min(dates), report_end=max(dates))
+    validate_unique(records)
+    return {"records": records, "controls": {"count": len(records),
+            "cost_cents": sum(r["project_cost_cents"] or 0 for r in records),
+            "period_basis": "Issue dates in rows; not the filename"}}
 
-    This handler is never used for the authenticated Cloudflare API client.
-    A redirect to a login service or another host cannot satisfy verification.
+
+def remove_clipped_header_wrappers(raw):
+    """Discard M5 header-only Form wrappers that re-draw the entire first page.
+
+    M5 embeds a nested copy of the first page's table under a header-sized
+    clipping rectangle. Ordinary PDF extraction wrongly reads its invisible
+    body rows. Remove only wrappers with exactly q/cm/Do/Q, a single nested
+    Form, and a short, offset bounding box. The primary tables stay intact.
+    This transforms an in-memory extraction copy; the source stays unchanged.
+    Count/type/cost/fee checks below still gate publication.
     """
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        destination = urljoin(req.full_url, newurl)
-        before, after = urlsplit(req.full_url), urlsplit(destination)
-        if (after.scheme != "https" or after.hostname != before.hostname
-                or after.port not in (None, 443) or after.username or after.password):
-            return None
-        return super().redirect_request(req, fp, code, msg, headers, destination)
+    reader = PdfReader(io.BytesIO(raw))
+    writer = PdfWriter()
+    writer.clone_document_from_reader(reader)
+    removed = 0
+    for page in writer.pages:
+        for value in page["/Resources"].get("/XObject", {}).values():
+            obj = value.get_object()
+            box = obj.get("/BBox")
+            if obj.get("/Subtype") != "/Form" or not box:
+                continue
+            ops = ContentStream(obj, writer).operations
+            if (0 < float(box[3]) - float(box[1]) < 40
+                    and float(box[1]) > float(page.mediabox.height) / 2
+                    and [op for _, op in ops] == [b"q", b"cm", b"Do", b"Q"]):
+                target = obj["/Resources"]["/XObject"][ops[2][0][0]].get_object()
+                target_box = target.get("/BBox")
+                if target.get("/Subtype") == "/Form" and target_box and float(target_box[3]) - float(target_box[1]) > 100:
+                    obj.set_data(b"")
+                    removed += 1
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue(), removed
 
 
-def strict_json(raw):
-    def pairs(items):
-        obj = {}
-        for key, value in items:
-            if key in obj:
-                raise ValueError("duplicate_json_key")
-            obj[key] = value
-        return obj
-
-    def invalid_constant(_):
-        raise ValueError("invalid_json_number")
-
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=invalid_constant)
+def owner_name(cell):
+    # County owner cell also includes a mailing address and sometimes a phone.
+    # Keep only the name preceding the first address/number line.
+    lines = [clean(line) for line in cell.splitlines() if clean(line)]
+    name = []
+    for line in lines:
+        if re.match(r"(?:\d|[NSEW]\d|P\.?\s*O\.?\s+BOX)", line, re.I):
+            break
+        name.append(line)
+    return clean(" ".join(name)) or None
 
 
-def same_public_data(actual, expected):
-    # Static delivery can change insignificant JSON formatting or key order.
-    # Every field, record, timestamp and list order must still match.
-    if actual == expected:
-        return True
-    try:
-        return json_bytes(strict_json(actual)) == json_bytes(strict_json(expected))
-    except (ValueError, UnicodeError, TypeError, RecursionError):
-        return False
+def county_page_tables(page, columns):
+    """Repair missing internal borders using this report's verified header.
 
-
-def public_body(response):
-    raw = response.read(MAX_VALUE + 1)
-    if len(raw) > MAX_VALUE:
-        raise ServiceError("response_too_large")
-    encoding = getattr(response, "headers", {}).get("Content-Encoding", "identity").strip().lower()
-    try:
-        if encoding == "gzip":
-            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
-                raw = stream.read(MAX_VALUE + 1)
-        elif encoding == "deflate":
-            decoder = zlib.decompressobj()
-            raw = decoder.decompress(raw, MAX_VALUE + 1)
-            if decoder.unconsumed_tail or not decoder.eof:
-                raise ServiceError("invalid_compressed_response")
-        elif encoding not in ("", "identity"):
-            raise ServiceError("unsupported_response_encoding")
-    except (OSError, EOFError, zlib.error):
-        raise ServiceError("invalid_compressed_response") from None
-    if len(raw) > MAX_VALUE:
-        raise ServiceError("response_too_large")
-    return raw
-
-
-class Pages:
-    def __init__(self, api, project_name, *, sleep=time.sleep):
-        self.api, self.project_name, self.sleep = api, project_name, sleep
-
-    def publish(self, folder, data):
-        project = self.api.project(self.project_name)
-        # subprocess arguments, never a shell command assembled from input.
-        env = dict(os.environ, CLOUDFLARE_API_TOKEN=self.api.token,
-                   CLOUDFLARE_ACCOUNT_ID=self.api.account, CI="true",
-                   WRANGLER_SEND_METRICS="false")
-        try:
-            completed = subprocess.run(
-                ["npx", "--yes", "wrangler@" + WRANGLER, "pages", "deploy", str(folder),
-                 "--project-name", project["name"], "--branch", project["branch"],
-                 "--commit-dirty=true"], env=env, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=360, check=False,
-                # No repository wrangler config or private sources in this directory.
-                cwd=str(folder))
-        except (OSError, subprocess.TimeoutExpired):
-            raise ServiceError("pages_deployment_unavailable") from None
-        if completed.returncode:
-            raise ServiceError("pages_deployment_failed")
-        self.verify(project["hostname"], json_bytes(data))
-        return "https://" + project["hostname"]
-
-    def verify(self, hostname, expected):
-        if not re.fullmatch(r"[a-z0-9-]+\.pages\.dev", hostname):
-            raise ServiceError("invalid_public_hostname")
-        digest = hashlib.sha256(expected).hexdigest()
-        url = "https://" + hostname + "/permits.json?publish=" + digest
-        opener = build_opener(PublicSiteRedirect())
-        last_reason = "not_checked"
-        for attempt in range(6):
-            try:
-                req = Request(url, headers={"Cache-Control": "no-cache",
-                              "Accept": "application/json", "Accept-Encoding": "identity",
-                              "User-Agent": "LaCrosseTribune-Permits-Publisher/1.1"})
-                with opener.open(req, timeout=20) as response:
-                    raw = public_body(response)
-                if same_public_data(raw, expected):
-                    print("Public-site verification passed.")
-                    return
-                try:
-                    strict_json(raw)
-                    last_reason = "different_public_data"
-                except (ValueError, UnicodeError, TypeError, RecursionError):
-                    last_reason = "response_is_not_valid_json"
-            except HTTPError as exc:
-                last_reason = f"http_{exc.code}"
-                exc.close()
-            except URLError as exc:
-                if isinstance(exc.reason, socket.gaierror):
-                    last_reason = "dns_lookup_failed"
-                elif isinstance(exc.reason, ssl.SSLError):
-                    last_reason = "tls_connection_failed"
-                else:
-                    last_reason = "network_request_failed"
-            except (OSError, TimeoutError):
-                last_reason = "network_request_failed"
-            except ServiceError as exc:
-                last_reason = exc.code
-            # Fixed classifications only: never log response bodies, credentials,
-            # cookies, source contents or raw exception strings.
-            print(f"Public-site verification {attempt + 1}/6: {last_reason}.", flush=True)
-            if attempt < 5:
-                self.sleep(min(30, 5 * (2 ** attempt)))
-        raise ServiceError("pages_production_verification_failed_" + last_reason)
-
-
-def read_state(api):
-    state = api.get_json(STATE_KEY)
-    if state is None:
-        return {"schema_version": 1, "files": {}, "public": None}
-    if (not isinstance(state, dict) or state.get("schema_version") != 1
-            or not isinstance(state.get("files"), dict)):
-        raise ServiceError("invalid_private_state")
-    for ident, entry in state["files"].items():
-        if not isinstance(entry, dict) or ident != entry.get("metadata", {}).get("id"):
-            raise ServiceError("invalid_private_state")
-        upload_metadata({"name": "uploads/" + ident, "metadata": entry["metadata"]})
-        if entry.get("modified") != entry["metadata"]["uploaded_at"] or not isinstance(entry.get("records"), list):
-            raise ServiceError("invalid_private_state")
-        try:
-            validate_unique(entry["records"])
-        except Exception:
-            raise ServiceError("invalid_private_state") from None
-    if state.get("public") is not None:
-        validate_public(state["public"])
-    return state
-
-
-def status_record(previous, uploaded, now, *, rejected=(), held=False, message=None):
-    accepted = set(previous["files"])
-    files = {ident: {"state": "published", "message": "Included in the published database."}
-             for ident in accepted}
-    for ident in uploaded:
-        if ident not in accepted:
-            files[ident] = {"state": "stored", "message": message or
-                           ("Waiting for another report in this batch to be reviewed." if held else
-                            "Waiting for the next daily import.")}
-    for ident in rejected:
-        files[ident] = {"state": "rejected", "message":
-                       "Report could not be validated. Ask the editor to review its format or totals; the previous public data was kept."}
-    return {"schema_version": 1, "publishing_connected": bool(previous.get("public")),
-            "last_run": now, "files": files}
-
-
-def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
-    now = now or datetime.now(timezone.utc).isoformat()
-    clock = utc(now)
-    previous = read_state(api)
-    uploaded = {}
-    for item in api.list_uploads():
-        meta = upload_metadata(item)
-        if utc(meta["uploaded_at"]) > clock:
-            raise ServiceError("source_timestamp_in_future")
-        if meta["id"] in uploaded and uploaded[meta["id"]] != meta:
-            raise ServiceError("inconsistent_upload_listing")
-        uploaded[meta["id"]] = meta
-    files = copy.deepcopy(previous["files"])
-    rejected, pending = [], []
-    # Cached originals may be missing from an eventually consistent listing.
-    # Retain history; reparse the private immutable original after parser changes.
-    wanted = {ident: entry["metadata"] for ident, entry in files.items()}
-    wanted.update(uploaded)
-    for ident, meta in sorted(wanted.items(), key=lambda pair: (pair[1]["uploaded_at"], pair[0])):
-        prior = files.get(ident)
-        if prior:
-            # Two near-simultaneous duplicate uploads can race in eventual KV.
-            # Their bytes/id are identical, but the last metadata write may carry
-            # a later upload time. Retain the first accepted source precedence.
-            identity = lambda m: {k: v for k, v in m.items() if k != "uploaded_at"}
-            if identity(prior["metadata"]) != identity(meta):
-                raise ServiceError("immutable_source_metadata_changed")
-            meta = prior["metadata"]
-        if prior and prior.get("parser_version") == PARSER_VERSION:
+    Some M5 rows have one spanning cell where the vertical border segments
+    are missing. Reuse the 20 column boundaries from the exact supported
+    header, within the original table bounds. Summary tables are untouched.
+    No text or source values are inferred; reconciliation remains mandatory.
+    """
+    extracted = []
+    for found in page.find_tables():
+        table = found.extract()
+        if not table or len(table[0]) != 20:
+            extracted.append(table)
             continue
-        if (clock - utc(meta["uploaded_at"])).total_seconds() < 90:
-            pending.append(ident)
-            continue
-        try:
-            raw = api.get_value("uploads/" + ident, limit=MAX_SOURCE)
-            if len(raw) != meta["bytes"] or hashlib.sha256(raw).hexdigest() != meta["sha256"]:
-                raise ServiceError("source_content_hash_mismatch")
-            parsed = parser(raw, meta["name"])
-            if parsed["sha256"] != meta["sha256"] or parsed["parser_version"] != PARSER_VERSION:
-                raise ServiceError("invalid_parser_result")
-            validate_unique(parsed["records"])
-            files[ident] = {"metadata": meta, "modified": meta["uploaded_at"],
-                            "parser_version": PARSER_VERSION, "records": parsed["records"],
-                            "controls": parsed["controls"]}
-        except ServiceError:
-            # Transport/quota errors are retryable failures, not bad-report diagnoses.
-            api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
-                         message="Import was interrupted. The previous public data was kept; retry the daily workflow."))
-            raise
-        except Exception:
-            # Parser exceptions can contain private contact blocks. Never expose them.
-            rejected.append(ident)
-    if rejected or pending:
-        api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
-                     rejected=rejected, held=True, message=(
-                         "A recent upload is still settling. Run the daily import again in a few minutes." if pending and not rejected else None)))
-        raise ServiceError("report_validation_failed" if rejected else "recent_upload_pending")
-    if not files:
-        api.put_json(STATUS_KEY, status_record(previous, uploaded, now))
-        raise ServiceError("no_reports_uploaded")
-    # Each upload version is a historical source. Latest upload wins per permit ID.
-    # An omitted permit is NOT an automatic deletion of historical public records.
-    data = public_dataset(files, generated_at=now)
-    prior_public = previous.get("public")
-    changed = not prior_public or any(data.get(k) != prior_public.get(k)
-                                      for k in ("records", "source_count", "methodology"))
-    if not changed:
-        data["generated_at"] = prior_public["generated_at"]
-    data.update(last_checked_at=now, import_status="published")
-    validate_public(data)
-    state = {"schema_version": 1, "files": files, "public": data}
-    if len(json_bytes(state)) > MAX_VALUE:
-        raise ServiceError("private_state_capacity")
+        for index, row in enumerate(table):
+            if clean(row[0]) == "Department":
+                if [clean(value) for value in row] != PDF_FIELDS:
+                    raise ValidationError("County PDF column layout changed")
+                boxes = found.rows[index].cells
+                if any(box is None for box in boxes):
+                    raise ValidationError("County header column boundaries are incomplete")
+                columns = sorted({x for box in boxes for x in (box[0], box[2])})
+                if len(columns) != 21:
+                    raise ValidationError("County header must define 20 columns")
+        if any(value is None for row in table for value in row):
+            if (columns is None or abs(found.bbox[0] - columns[0]) > 2
+                    or abs(found.bbox[2] - columns[-1]) > 2):
+                raise ValidationError("County table cannot be aligned with its verified header")
+            repaired = page.crop(found.bbox).extract_tables({
+                "vertical_strategy": "explicit", "explicit_vertical_lines": columns})
+            if len(repaired) != 1 or any(len(row) != 20 for row in repaired[0]):
+                raise ValidationError("County table border repair needs review")
+            table = repaired[0]
+        extracted.append(table)
+    return extracted, columns
+
+
+def parse_county_pdf(raw: bytes, source_name: str):
+    prepared, removed = remove_clipped_header_wrappers(raw)
+    rows, control, by_type = [], None, None
+    with pdfplumber.open(io.BytesIO(prepared)) as doc:
+        head = doc.pages[0].extract_text() or ""
+        if "La Crosse County" not in head or "M5 New Permit Report" not in head:
+            raise ValidationError("PDF is not the supported La Crosse County M5 permit report")
+        period = re.search(r"From\s+(\d{1,2}/\d{1,2}/\d{4})\s+To\s+(\d{1,2}/\d{1,2}/\d{4})", head)
+        if not period:
+            raise ValidationError("County PDF lacks its reporting period")
+        start, end = parse_date(period[1], True), parse_date(period[2], True)
+        saw_header, columns = False, None
+        for page_number, page in enumerate(doc.pages, 1):
+            tables, columns = county_page_tables(page, columns)
+            for table in tables:
+                if not table:
+                    continue
+                if len(table[0]) == 5 and clean(table[0][0]).lower() == "count by type":
+                    by_type = {clean(row[0]): int(clean(row[1])) for row in table[2:]
+                               if row[0] and clean(row[0]) != "Total:"}
+                if len(table[0]) != 20:
+                    continue
+                for row in table:
+                    row = [value or "" for value in row]
+                    if clean(row[0]) == "Department":
+                        if [clean(v) for v in row] != PDF_FIELDS:
+                            raise ValidationError("County PDF column layout changed")
+                        saw_header = True
+                        continue
+                    if clean(row[0]) == "Total:":
+                        if control is not None:
+                            raise ValidationError("Multiple county detail totals")
+                        control = {"count": int(clean(row[1])), "fee_cents": cents(row[12]),
+                                   "cost_cents": cents(row[13])}
+                        continue
+                    if not any(clean(v) for v in row):
+                        continue
+                    if clean(row[3]):
+                        # Preserve the source's identifier, including AGC agricultural
+                        # certificates and other year-number series in this county
+                        # report. Department, type summaries and totals still gate it.
+                        if not re.fullmatch(r"(?:[A-Z]{2,6}-\d{2}(?:\d{2})?-\d+|CU-\d+|STR\s+\d+)", clean(row[3])):
+                            raise ValidationError("Unexpected county permit identifier")
+                        if clean(row[0]) != "Zoning Department":
+                            raise ValidationError("Unexpected county department")
+                        rows.append({"cells": row, "pages": [page_number]})
+                    else:
+                        if not rows or any(clean(row[i]) for i in [0, 1, 2, 4, 5, 12, 13, 15, 16]):
+                            raise ValidationError("Unrecognized county continuation row")
+                        for i, value in enumerate(row):
+                            if value:
+                                rows[-1]["cells"][i] += "\n" + value
+                        rows[-1]["pages"].append(page_number)
+    if not saw_header or control is None or by_type is None:
+        raise ValidationError("County PDF is missing its column header or control summaries")
+    records = []
+    for row in rows:
+        c = row["cells"]
+        work = c[7].split("/", 1)
+        if len(work) != 2:
+            raise ValidationError("Work parcel/address is missing its separator")
+        parcel, address = clean(work[0]), clean(work[1])
+        if not address:
+            raise ValidationError("County work address is missing")
+        r = base_record("county-zoning", clean(c[3]), parcel, source_name)
+        r.update({
+            "category": "Zoning", "permit_type": clean(c[4]), "status": clean(c[5]),
+            "application_date": parse_date(c[1]), "issued_date": parse_date(c[2], True),
+            "address": address, "owner": owner_name(c[6]),
+            # Contractor cells mix names, home/business addresses, phones and
+            # emails without separators. Publish no guessed contractor name.
+            "contractor": None, "company": clean(c[9]) or None,
+            "description": clean(c[11]), "fee_cents": cents(c[12]),
+            "project_cost_cents": cents(c[13]), "source_pages": row["pages"],
+            "report_start": start, "report_end": end,
+        })
+        if not start <= r["issued_date"] <= end:
+            raise ValidationError("County issue date is outside the report period")
+        if not r["status"] or not r["permit_type"]:
+            raise ValidationError("Missing county permit type/status")
+        records.append(r)
+    validate_unique(records)
+    observed = {"count": len(records), "fee_cents": sum(r["fee_cents"] or 0 for r in records),
+                "cost_cents": sum(r["project_cost_cents"] or 0 for r in records)}
+    if control != observed or dict(Counter(r["permit_type"] for r in records)) != by_type:
+        raise ValidationError(f"County PDF reconciliation failed: expected {control}, got {observed}")
+    return {"records": records, "controls": {**control, "by_type": by_type,
+            "clipped_header_wrappers_removed": removed}}
+
+
+def validate_unique(records):
+    ids = [r["id"] for r in records]
+    if len(ids) != len(set(ids)):
+        raise ValidationError("Duplicate permit number within one jurisdiction/report")
+    for r in records:
+        if set(r) - PUBLIC_FIELDS:
+            raise ValidationError("Unexpected public field")
+        # Do not pass source contact columns or unexpected email/phone material.
+        public = json.dumps(r)
+        if re.search(r"[\w.+-]+@[\w.-]+\.\w+", public) or re.search(r"(?:\(\d{3}\)\s*|\b\d{3}[-.])\d{3}[-.]\d{4}\b", public):
+            raise ValidationError(f"Contact information needs review: {r['permit_number']}")
+
+
+def parse_report(raw, name):
     try:
-        with tempfile.TemporaryDirectory(prefix="permits-site-") as temp:
-            folder = Path(temp).resolve()
-            write_site(folder, data, html_path)
-            public_url = pages.publish(folder, data)
-    except Exception:
-        api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
-                     message="Publication was interrupted. No new upload was marked published; retry the daily workflow."))
-        raise
-    # Only acknowledge after the exact production JSON is verified. If either KV
-    # write fails, retries are safe because every original is immutable and retained.
-    api.put_json(STATE_KEY, state)
-    api.put_json(STATUS_KEY, status_record(state, uploaded, now))
-    return {"public": data, "public_url": public_url, "changed": changed}
+        if name.lower().endswith(".csv"):
+            result = parse_city_csv(raw, name)
+        elif name.lower().endswith(".pdf"):
+            result = parse_county_pdf(raw, name)
+        else:
+            raise ValidationError("Only building CSV and county zoning PDF files are supported")
+    except (csv.Error, KeyError, TypeError, IndexError) as exc:
+        raise ValidationError(f"Report structure needs review: {type(exc).__name__}") from exc
+    return {**result, "sha256": hashlib.sha256(raw).hexdigest(), "parser_version": PARSER_VERSION}
 
 
-def main():
-    args = argparse.ArgumentParser()
-    args.add_argument("--public-output", default="public/permits.json")
-    args.add_argument("--starter", help="Build an empty static starter folder; no credentials needed.")
-    opts = args.parse_args()
-    root = Path(__file__).resolve().parent
-    if opts.starter:
-        write_site(opts.starter, initial_dataset(), root / "web/index.html")
-        return 0
-    try:
-        # Enforce the free standard-runner/public-repository design.
-        if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("PERMITS_PUBLIC_REPOSITORY") != "true":
-            raise ServiceError("run_only_in_the_public_repository_workflow")
-        api = Cloudflare(os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""),
-                         os.environ.get("CLOUDFLARE_KV_NAMESPACE_ID", ""),
-                         os.environ.get("CLOUDFLARE_API_TOKEN", ""))
-        pages = Pages(api, os.environ.get("CLOUDFLARE_PAGES_PROJECT", ""))
-        result = publish_daily(api, pages, root / "web/index.html")
-        target = Path(opts.public_output)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(json_bytes(result["public"]))
-        # Only counts and fixed messages go to the public workflow log.
-        print(f"Published {result['public']['record_count']} validated permit records.")
-        return 0
-    except Exception as exc:
-        print("Daily import stopped: " + (exc.code if isinstance(exc, ServiceError) else "review_required"), file=sys.stderr)
-        print("No new upload was marked published before production verification.", file=sys.stderr)
-        return 1
+def public_dataset(files, generated_at=None):
+    """Latest modified source wins per jurisdiction + permit ID.
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+    Missing files remain in private state. Moving/removing a source does not
+    silently erase public history. A changed file replaces its own rows.
+    """
+    records = {}
+    for _, entry in sorted(files.items(), key=lambda pair: (pair[1]["modified"], pair[0])):
+        for r in entry["records"]:
+            records[r["id"]] = r
+    result = sorted(records.values(), key=lambda r: (r["issued_date"], r["id"]), reverse=True)
+    validate_unique(result)
+    return {
+        "schema_version": 1, "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
+        "latest_issue_date": max((r["issued_date"] for r in result), default=None),
+        "record_count": len(result), "source_count": len(files), "records": result,
+        "municipality_source": MUNICIPALITY_SOURCE,
+        "methodology": "City building CSV and La Crosse County M5 zoning reports. Work locations use the work parcel/address. Municipalities derive from Wisconsin Department of Revenue parcel prefixes. Blank costs remain unreported. Costs describe permits, not distinct projects or completed construction.",
+    }
