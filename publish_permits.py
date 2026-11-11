@@ -292,9 +292,32 @@ def status_record(previous, uploaded, now, *, rejected=(), held=False, message=N
                             "Waiting for the next daily import.")}
     for ident in rejected:
         files[ident] = {"state": "rejected", "message":
-                       "Report could not be validated. Ask the editor to review its format or totals; the previous public data was kept."}
+                       (rejected[ident] if isinstance(rejected, dict) else
+                        "Report could not be validated. Ask the editor to review its format or totals; the previous public data was kept.")}
     return {"schema_version": 1, "publishing_connected": bool(previous.get("public")),
             "last_run": now, "files": files}
+
+
+def private_report_hint(exc):
+    """Return fixed staff-facing guidance; never copy source text or exceptions."""
+    text = str(exc).lower()
+    if 'reconciliation' in text or 'duplicate permit' in text:
+        detail = 'Report counts, fees, construction costs or permit identities did not reconcile.'
+    elif 'contact information' in text:
+        detail = 'A proposed public field contains contact information that needs editorial review.'
+    elif any(word in text for word in ('header', 'column', 'border', 'continuation', 'layout')):
+        detail = 'The report table layout or a row split needs parser review.'
+    elif any(word in text for word in ('parcel', 'address', 'separator')):
+        detail = 'A work parcel or address field needs review.'
+    elif 'date' in text or 'period' in text:
+        detail = 'A source date or reporting period needs review.'
+    elif 'identifier' in text or 'permit number' in text:
+        detail = 'A source permit identifier needs review.'
+    elif 'department' in text:
+        detail = 'The report contains an unrecognized source department.'
+    else:
+        detail = 'The report format or a source field needs parser review.'
+    return detail + ' The previous public data was kept.'
 
 
 def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
@@ -310,7 +333,7 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
             raise ServiceError("inconsistent_upload_listing")
         uploaded[meta["id"]] = meta
     files = copy.deepcopy(previous["files"])
-    rejected, pending = [], []
+    rejected, pending = {}, []
     # Cached originals may be missing from an eventually consistent listing.
     # Retain history; reparse the private immutable original after parser changes.
     wanted = {ident: entry["metadata"] for ident, entry in files.items()}
@@ -346,9 +369,9 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
             api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
                          message="Import was interrupted. The previous public data was kept; retry the daily workflow."))
             raise
-        except Exception:
+        except Exception as exc:
             # Parser exceptions can contain private contact blocks. Never expose them.
-            rejected.append(ident)
+            rejected[ident] = private_report_hint(exc)
     if rejected or pending:
         api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
                      rejected=rejected, held=True, message=(

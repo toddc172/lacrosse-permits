@@ -1,22 +1,28 @@
 """Publication safeguards; no network, credentials, or private report fixtures required."""
 import copy
 import csv
+import gzip
 import hashlib
 import io
 import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.request import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from cloudflare_client import Cloudflare, NoRedirect, ServiceError, json_bytes
 from permit_data import CSV_FIELDS, PARSER_VERSION, parse_report
+from permit_data import PDF_FIELDS, parse_county_pdf, ValidationError
 from publish_permits import (Pages, STATE_KEY, STATUS_KEY, initial_dataset, main,
+                             PublicSiteRedirect, public_body, same_public_data,
                              publish_daily, upload_metadata, validate_public, write_site)
+from publish_permits import private_report_hint
 
 NOW = "2026-11-10T13:17:00+00:00"
 LATER = "2026-11-11T13:17:00+00:00"
@@ -258,6 +264,112 @@ class Response(io.BytesIO):
     pass
 
 
+class CountyVariantTests(unittest.TestCase):
+    def synthetic_county(self, number='4', kind='Sign Permit', work='06-00171-005 / N1936 TEST RD', department='Zoning Department'):
+        row = [department, '10/1/2026', '10/2/2026', number, kind, 'Issued',
+               'TEST OWNER\n123 MAILING ST', work, '', '', '', 'TEST WORK',
+               '', '$0.00', '', '', '', '', '', '']
+        total = [''] * 20
+        total[0], total[1], total[12], total[13] = 'Total:', '1', '$0.00', '$0.00'
+        tables = [
+            [list(PDF_FIELDS), row, total],
+            [['Count by Type', None, None, None, None],
+             ['Type', 'Count', 'Fees', 'Cost Of Construction', 'Sq Feet'],
+             [kind, '1', '$0.00', '$0.00', '0'],
+             ['Total:', '1', '$0.00', '$0.00', '0']]]
+        found = [SimpleNamespace(extract=lambda t=t: t, bbox=(0, 0, 20, 10),
+                 rows=[SimpleNamespace(cells=[(i, 0, i+1, 1) for i in range(20)])]) for t in tables]
+        page = SimpleNamespace(extract_text=lambda: 'La Crosse County M5 New Permit Report From 10/1/2026 To 10/5/2026',
+                               find_tables=lambda: found)
+        doc = SimpleNamespace(pages=[page])
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = doc
+        with patch('permit_data.remove_clipped_header_wrappers', return_value=(b'test', 0)), patch('permit_data.pdfplumber.open', return_value=context):
+            return parse_county_pdf(b'test', 'synthetic.pdf')['records'][0]
+
+    def test_legacy_identifiers_are_preserved_and_normalized_for_matching(self):
+        for number in ('ACUP 1295A', 'ACUP-1210Amended', 'ZPT 2090', 'VAR2026-03', 'SE-2026--02', 'AGW 2026-01', 'CU-1298A'):
+            self.assertEqual(self.synthetic_county(number=number)['permit_number'], number)
+        a = self.synthetic_county(number='ACUP 1295A')
+        b = self.synthetic_county(number='ACUP-1295A')
+        self.assertEqual(a['id'], b['id'])
+
+    def test_small_numeric_numbers_do_not_merge_different_permit_types(self):
+        a = self.synthetic_county(number='4', kind='Sign Permit')
+        b = self.synthetic_county(number='4', kind='Short Term Rental')
+        self.assertNotEqual(a['id'], b['id'])
+        self.assertEqual(a['permit_number'], '4')
+
+    def test_missing_source_fields_are_flagged_without_mailing_address_substitution(self):
+        row = self.synthetic_county(number='', work='06-00171-005 /')
+        self.assertIsNone(row['permit_number'])
+        self.assertEqual(row['address'], 'Not reported in source')
+        self.assertEqual(row['municipality'], 'Town of Greenfield')
+        self.assertNotIn('MAILING', str(row))
+        self.assertTrue(row['notes'])
+        missing = self.synthetic_county(work='')
+        self.assertEqual(missing['municipality'], 'Not reported')
+
+    def test_other_report_departments_are_explicit_and_unknown_departments_fail(self):
+        row = self.synthetic_county(number='2026035', kind='Well Permit', department='Health Department')
+        self.assertIn('Health Department', ' '.join(row['notes']))
+        with self.assertRaises(ValidationError):
+            self.synthetic_county(department='Unexpected Department')
+
+    def test_private_review_hints_never_copy_raw_exception_text(self):
+        hint = private_report_hint(ValidationError('Contact information needs review: private@email.test'))
+        self.assertIn('contact information', hint)
+        self.assertNotIn('private@email', hint)
+
+    def test_full_attached_backfill_batch(self):
+        expected = {
+            'February ZO Permit Report 2.1.26 - 2.28.26.pdf': (17, 342500000, 0),
+            'March ZO Permit Report 3.1.26 - 3.31.26.pdf': (36, 524043499, 285000),
+            'Weekly ZO Permit Report 1.15.26 - 1.21.26.pdf': (3, 3000000, 0),
+            'Weekly ZO Permit Report 11.6.25 - 11.12.25.pdf': (9, 221000000, 55000),
+            'Weekly ZO Permit Report 12.18.25 - 1.7.26.pdf': (6, 10852400, 50000),
+            'Weekly ZO Permit Report 12.4.25 - 12.10.25.pdf': (4, 38620000, 0),
+            'Weekly ZO Permit Report 4.16.26 - 4.22.26.pdf': (19, 279857280, 207500),
+            'Weekly ZO Permit Report 4.23.26 - 4.29.26.pdf': (16, 137736999, 0),
+            'Weekly ZO Permit Report 4.30.26 - 5.6.26.pdf': (11, 256800000, 50000),
+            'Weekly ZO Permit Report 5.14.26 - 5.20.26.pdf': (10, 144319000, 42500),
+            'Weekly ZO Permit Report 5.21.26 - 5.27.26.pdf': (13, 54765000, 37500),
+            'Weekly ZO Permit Report 5.28.26 - 6.3.26.pdf': (9, 97889999, 50000),
+            'Weekly ZO Permit Report 7.2.26 - 7.8.26.pdf': (8, 120120000, 12500),
+            'Weekly ZO Permit Report 7.30.26 - 8.5.26.pdf': (6, 25080000, 0),
+            'Weekly ZO Permit Report 8.20.26 - 8.26.26.pdf': (9, 72785000, 80000),
+            'Weekly ZO Permit Report 8.6.26 - 8.12.26.pdf': (7, 139151500, 0),
+            'Weekly ZO Permit Report 9.10.26 - 9.16.26.pdf': (11, 211960053, 160000)}
+        if not all((ROOT.parent / 'upload' / name).exists() for name in expected):
+            self.skipTest('Private backfill reports are not distributed with public code')
+        for name, controls in expected.items():
+            with self.subTest(report=name):
+                result = parse_report((ROOT.parent / 'upload' / name).read_bytes(), name)
+                c = result['controls']
+                self.assertEqual((c['count'], c['cost_cents'], c['fee_cents']), controls)
+
+    def test_agricultural_certificate_and_broken_row_borders_reconcile(self):
+        source = ROOT.parent / 'upload/Weekly ZO Permit Report 9.17.26 - 9.23.26.pdf'
+        if not source.exists():
+            self.skipTest('Private September source report is not distributed with public code')
+        result = parse_report(source.read_bytes(), source.name)
+        records = {r['permit_number']: r for r in result['records']}
+        self.assertEqual(len(records), 10)
+        self.assertEqual(result['controls']['by_type'],
+                         {'Agricultural Certificate': 1, 'Zoning/Occupancy': 9})
+        self.assertEqual(result['controls']['cost_cents'], 43150000)
+        self.assertEqual(result['controls']['fee_cents'], 62500)
+        self.assertEqual(records['AGC-26-0011']['source_pages'], [1, 2])
+        self.assertEqual(records['AGC-26-0011']['project_cost_cents'], 10000000)
+        repaired = records['ZO-26-0244']
+        self.assertEqual(repaired['parcel'], '06-00171-005')
+        self.assertEqual(repaired['address'], 'N1936 COUNTY ROAD OA')
+        self.assertEqual(repaired['municipality'], 'Town of Greenfield')
+        self.assertEqual(repaired['project_cost_cents'], 750000)
+        self.assertEqual(repaired['source_pages'], [2])
+        self.assertTrue(all(r['contractor'] is None for r in records.values()))
+
+
 class FakeOpener:
     def __init__(self, responses):
         self.responses, self.requests = list(responses), []
@@ -338,6 +450,50 @@ class TransportTests(unittest.TestCase):
         with patch("publish_permits.build_opener", return_value=opener):
             pages.verify("project.pages.dev", b"expected")
         self.assertEqual(len(opener.requests), 2)
+
+    def test_equivalent_json_formatting_is_accepted(self):
+        expected = json_bytes({"records": [{"id": "city:1", "cost": 0}], "record_count": 1})
+        actual = b'{ "record_count": 1, "records": [ {"cost": 0, "id": "city:1"} ] }\r\n'
+        self.assertTrue(same_public_data(actual, expected))
+        self.assertFalse(same_public_data(actual.replace(b'"cost": 0', b'"cost": 1'), expected))
+        self.assertFalse(same_public_data(actual.replace(b'"cost": 0', b'"cost": false'), expected))
+
+    def test_json_duplicate_keys_and_nonfinite_numbers_are_not_normalized(self):
+        self.assertFalse(same_public_data(b'{"count":1,"count":0}', b'{"count":0}'))
+        self.assertFalse(same_public_data(b'{"count":NaN}', b'{"count":null}'))
+
+    def test_public_redirects_are_limited_to_same_host_https(self):
+        handler = PublicSiteRedirect()
+        req = Request('https://project.pages.dev/permits.json', headers={'Accept': 'application/json'})
+        next_request = handler.redirect_request(req, None, 302, '', {}, '/permits.json?new=1')
+        self.assertEqual(next_request.full_url, 'https://project.pages.dev/permits.json?new=1')
+        for target in ('https://login.invalid/', 'http://project.pages.dev/',
+                       'https://project.pages.dev:444/', 'https://user@project.pages.dev/'):
+            self.assertIsNone(handler.redirect_request(req, None, 302, '', {}, target))
+        self.assertIsNone(NoRedirect().redirect_request(req, None, 302, '', {}, '/anything'))
+
+    def test_compressed_public_data_is_checked_after_bounded_decoding(self):
+        expected = json_bytes({"record_count": 1, "records": [{"id": "city:1"}]})
+        response = Response(gzip.compress(expected))
+        response.headers = {'Content-Encoding': 'gzip'}
+        self.assertEqual(public_body(response), expected)
+        bad = Response(b'not gzip')
+        bad.headers = {'Content-Encoding': 'gzip'}
+        with self.assertRaisesRegex(ServiceError, 'invalid_compressed_response'):
+            public_body(bad)
+
+    def test_verification_diagnostics_classify_errors_without_private_text(self):
+        api, _ = self.api([])
+        pauses = []
+        pages = Pages(api, 'project', sleep=pauses.append)
+        errors = [HTTPError('https://project.pages.dev/', 403, 'PRIVATE_RESPONSE', {}, None) for _ in range(6)]
+        output = io.StringIO()
+        with patch('publish_permits.build_opener', return_value=FakeOpener(errors)), patch('sys.stdout', output):
+            with self.assertRaisesRegex(ServiceError, 'verification_failed_http_403'):
+                pages.verify('project.pages.dev', b'expected')
+        self.assertIn('http_403', output.getvalue())
+        self.assertNotIn('PRIVATE_RESPONSE', output.getvalue())
+        self.assertEqual(pauses, [5, 10, 20, 30, 30])
 
 
 if __name__ == "__main__":

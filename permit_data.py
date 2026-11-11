@@ -17,7 +17,7 @@ import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
 
-PARSER_VERSION = "1.1.0"
+PARSER_VERSION = "1.2.0"
 MUNICIPALITY_SOURCE = "https://www.revenue.wi.gov/Pages/UST/parcels.aspx"
 # Wisconsin Department of Revenue, La Crosse County parcel-prefix table.
 # Verified Nov. 9, 2026. Municipality is derived from the work parcel, never
@@ -47,7 +47,7 @@ PUBLIC_FIELDS = {
     "work_class", "issued_date", "application_date", "status", "address",
     "municipality", "municipality_method", "parcel", "owner", "contractor",
     "company", "description", "project_cost_cents", "fee_cents",
-    "source_file", "source_pages", "report_start", "report_end", "notes",
+    "source_file", "source_pages", "report_start", "report_end", "notes", "department",
 }
 
 
@@ -88,13 +88,14 @@ def municipality(parcel):
     return MUNICIPALITIES[int(match[1])]
 
 
-def base_record(jurisdiction, number, parcel, source_name):
+def base_record(jurisdiction, number, parcel, source_name, allow_missing_parcel=False):
     if not number:
         raise ValidationError("Missing permit number")
     return {
         "id": f"{jurisdiction}:{number.upper()}", "jurisdiction": jurisdiction,
         "permit_number": number, "parcel": parcel,
-        "municipality": municipality(parcel), "municipality_method": "Work parcel prefix",
+        "municipality": municipality(parcel) if parcel or not allow_missing_parcel else "Not reported",
+        "municipality_method": "Work parcel prefix" if parcel else "Not reported",
         "source_file": source_name, "source_pages": [], "notes": [],
         "owner": None, "contractor": None, "company": None, "work_class": None,
         "fee_cents": None, "report_start": None, "report_end": None,
@@ -207,7 +208,7 @@ def county_page_tables(page, columns):
             extracted.append(table)
             continue
         for index, row in enumerate(table):
-            if clean(row[0]) == "Department":
+            if clean(row[0]) == "Department" and clean(row[1]) == "Application Date":
                 if [clean(value) for value in row] != PDF_FIELDS:
                     raise ValidationError("County PDF column layout changed")
                 boxes = found.rows[index].cells
@@ -253,7 +254,7 @@ def parse_county_pdf(raw: bytes, source_name: str):
                     continue
                 for row in table:
                     row = [value or "" for value in row]
-                    if clean(row[0]) == "Department":
+                    if clean(row[0]) == "Department" and clean(row[1]) == "Application Date":
                         if [clean(v) for v in row] != PDF_FIELDS:
                             raise ValidationError("County PDF column layout changed")
                         saw_header = True
@@ -266,17 +267,15 @@ def parse_county_pdf(raw: bytes, source_name: str):
                         continue
                     if not any(clean(v) for v in row):
                         continue
-                    if clean(row[3]):
+                    if clean(row[3]) or (clean(row[0]) in ("Zoning Department", "Zoning", "Health Department", "Health", "Land Conservation") and clean(row[2])):
                         # Preserve the source's identifier, including AGC agricultural
                         # certificates and other year-number series in this county
                         # report. Department, type summaries and totals still gate it.
-                        if not re.fullmatch(r"(?:[A-Z]{2,6}-\d{2}(?:\d{2})?-\d+|CU-\d+|STR\s+\d+)", clean(row[3])):
+                        if clean(row[3]) and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}", clean(row[3])) or not re.search(r"\d", clean(row[3]))):
                             raise ValidationError("Unexpected county permit identifier")
-                        if clean(row[0]) != "Zoning Department":
-                            raise ValidationError("Unexpected county department")
                         rows.append({"cells": row, "pages": [page_number]})
                     else:
-                        if not rows or any(clean(row[i]) for i in [0, 1, 2, 4, 5, 12, 13, 15, 16]):
+                        if not rows or (clean(row[0]) not in ("", "Department")):
                             raise ValidationError("Unrecognized county continuation row")
                         for i, value in enumerate(row):
                             if value:
@@ -287,17 +286,20 @@ def parse_county_pdf(raw: bytes, source_name: str):
     records = []
     for row in rows:
         c = row["cells"]
+        department = clean(c[0])
+        if department not in ("Zoning Department", "Health Department", "Land Conservation"):
+            raise ValidationError("Unexpected county department")
         work = c[7].split("/", 1)
-        if len(work) != 2:
+        if len(work) != 2 and clean(c[7]):
             raise ValidationError("Work parcel/address is missing its separator")
-        parcel, address = clean(work[0]), clean(work[1])
-        if not address:
-            raise ValidationError("County work address is missing")
-        r = base_record("county-zoning", clean(c[3]), parcel, source_name)
+        parcel, address = (clean(work[0]), clean(work[1])) if len(work) == 2 else ("", "")
+        number = clean(c[3])
+        r = base_record("county-zoning", number or "UNREPORTED", parcel, source_name, allow_missing_parcel=True)
         r.update({
-            "category": "Zoning", "permit_type": clean(c[4]), "status": clean(c[5]),
+            "category": "Zoning", "department": department,
+            "permit_type": clean(c[4]), "status": clean(c[5]),
             "application_date": parse_date(c[1]), "issued_date": parse_date(c[2], True),
-            "address": address, "owner": owner_name(c[6]),
+            "address": address or "Not reported in source", "owner": owner_name(c[6]),
             # Contractor cells mix names, home/business addresses, phones and
             # emails without separators. Publish no guessed contractor name.
             "contractor": None, "company": clean(c[9]) or None,
@@ -305,6 +307,23 @@ def parse_county_pdf(raw: bytes, source_name: str):
             "project_cost_cents": cents(c[13]), "source_pages": row["pages"],
             "report_start": start, "report_end": end,
         })
+        if not number:
+            identity = [r['permit_type'], r['application_date'], r['issued_date'], parcel, address]
+            r['id'] = 'county-zoning:unreported:' + hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+            r['permit_number'] = None
+            r['notes'].append('The source does not supply a permit number. Cross-report matching uses reported type, dates and work parcel/address.')
+        elif number.isdigit():
+            r['id'] = 'county-zoning:' + r['permit_type'] + ':' + r['issued_date'][:4] + ':' + number
+        else:
+            # Older reports vary separators in ACUP, CUP, ZPT and VAR series.
+            canonical = re.sub(r'[ ._-]+', '', number.upper())
+            r['id'] = 'county-zoning:' + canonical if re.match(r'^(ACUP|CUP|ZPT|VAR)', canonical) else r['id']
+        if not address:
+            r['notes'].append('The source does not supply a work street address; no owner mailing address was substituted.')
+        if not parcel:
+            r['notes'].append('The source does not supply a work parcel; municipality is not inferred.')
+        if department != 'Zoning Department':
+            r['notes'].append('Source department: ' + department + '. Included in the county M5 report.')
         if not start <= r["issued_date"] <= end:
             raise ValidationError("County issue date is outside the report period")
         if not r["status"] or not r["permit_type"]:
