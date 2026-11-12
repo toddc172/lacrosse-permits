@@ -2,7 +2,7 @@
 
 Prepared for the La Crosse Tribune. Updated Nov. 10, 2026.
 
-The newsroom upload page is deployed. Todd confirmed sign-in, storing the two original reports and downloading an original. The daily GitHub publisher and static public site are implemented and tested locally, but **not connected or deployed yet**. Follow `PUBLISHING.md` for setup. Newsroom staff use the shared upload bookmark; they do not need GitHub or Cloudflare accounts for routine updates.
+The newsroom upload page and public Pages reader are deployed. Todd confirmed a successful GitHub publishing run, **41 permits on the public site**, and Published status for both original reports. The BLOX preview loads the embedded reader. Parser **1.2.0** now reconciles all 17 newly attached backfill PDFs, the prior September PDF and the original reports locally. It handles older identifiers, missing source fields and split rows; the reader identifies source departments in county reports. The updated package still needs deployment and a successful live backfill run. Follow `PUBLISHING.md`. Newsroom staff use the shared upload bookmark; they do not need GitHub or Cloudflare accounts for routine updates.
 
 ## Current design
 

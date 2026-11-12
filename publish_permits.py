@@ -333,6 +333,17 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
             raise ServiceError("inconsistent_upload_listing")
         uploaded[meta["id"]] = meta
     files = copy.deepcopy(previous["files"])
+    def remove_marked():
+        for ident in list(set(uploaded) | set(files)):
+            marker = api.get_json('removed/' + ident)
+            if marker is None:
+                continue
+            if not isinstance(marker, dict) or marker.get('schema_version') != 1 or marker.get('id') != ident:
+                raise ServiceError('invalid_removal_marker')
+            api.delete_value('uploads/' + ident)
+            uploaded.pop(ident, None)
+            files.pop(ident, None)
+    remove_marked()
     rejected, pending = {}, []
     # Cached originals may be missing from an eventually consistent listing.
     # Retain history; reparse the private immutable original after parser changes.
@@ -372,12 +383,15 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
         except Exception as exc:
             # Parser exceptions can contain private contact blocks. Never expose them.
             rejected[ident] = private_report_hint(exc)
+    remove_marked()
+    rejected = {ident: value for ident, value in rejected.items() if ident in uploaded or ident in files}
+    pending = [ident for ident in pending if ident in uploaded or ident in files]
     if rejected or pending:
         api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
                      rejected=rejected, held=True, message=(
                          "A recent upload is still settling. Run the daily import again in a few minutes." if pending and not rejected else None)))
         raise ServiceError("report_validation_failed" if rejected else "recent_upload_pending")
-    if not files:
+    if not files and not previous.get('public'):
         api.put_json(STATUS_KEY, status_record(previous, uploaded, now))
         raise ServiceError("no_reports_uploaded")
     # Each upload version is a historical source. Latest upload wins per permit ID.

@@ -65,6 +65,11 @@ class MemoryKV:
     def get_json(self, key):
         return copy.deepcopy(self.values.get(key))
 
+    def delete_value(self, key):
+        self.objects.pop(key, None)
+        if key.startswith('uploads/'):
+            self.metadata.pop(key.split('/', 1)[1], None)
+
     def put_json(self, key, value):
         if key == self.fail_key:
             raise ServiceError("cloudflare_http_429")
@@ -216,12 +221,13 @@ class PublisherTests(unittest.TestCase):
             self.run_daily()
         self.assertEqual(self.pages.deployments, 0)
 
-    def test_contact_content_in_public_fields_is_rejected(self):
+    def test_contact_content_in_public_text_is_redacted(self):
         raw = city().replace(b"Fence replacement", b"Call private@email.test")
         self.kv.upload(raw=raw)
-        with self.assertRaisesRegex(ServiceError, "report_validation_failed"):
-            self.run_daily()
-        self.assertEqual(self.pages.deployments, 0)
+        data = self.run_daily()['public']
+        self.assertNotIn('private@email', str(data))
+        self.assertIn('[email omitted]', data['records'][0]['description'])
+        self.assertTrue(data['records'][0]['notes'])
 
     def test_starter_is_clear_and_contains_only_static_allowlisted_files(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -242,6 +248,23 @@ class PublisherTests(unittest.TestCase):
 
     def test_no_reports_does_not_publish_a_misleading_empty_database(self):
         with self.assertRaisesRegex(ServiceError, "no_reports_uploaded"):
+            self.run_daily()
+        self.assertEqual(self.pages.deployments, 0)
+
+    def test_removed_rejected_file_never_enters_the_publication_batch(self):
+        good = self.kv.upload()
+        rejected = self.kv.upload('unrelated.pdf', b'%PDF-rejected-input')
+        self.kv.values['removed/' + rejected] = {'schema_version': 1, 'id': rejected, 'removed_at': NOW}
+        data = self.run_daily()['public']
+        self.assertEqual(data['record_count'], 1)
+        self.assertNotIn(rejected, self.kv.values[STATE_KEY]['files'])
+        self.assertNotIn('uploads/' + rejected, self.kv.objects)
+        self.assertIn(good, self.kv.values[STATE_KEY]['files'])
+
+    def test_invalid_removal_marker_stops_publication(self):
+        ident = self.kv.upload()
+        self.kv.values['removed/' + ident] = {'schema_version': 1, 'id': 'wrong'}
+        with self.assertRaisesRegex(ServiceError, 'invalid_removal_marker'):
             self.run_daily()
         self.assertEqual(self.pages.deployments, 0)
 
@@ -347,6 +370,41 @@ class CountyVariantTests(unittest.TestCase):
                 result = parse_report((ROOT.parent / 'upload' / name).read_bytes(), name)
                 c = result['controls']
                 self.assertEqual((c['count'], c['cost_cents'], c['fee_cents']), controls)
+
+    def test_legacy_attachment_batch_and_image_only_exclusions(self):
+        folder = ROOT.parent / 'tmp/new-batch-2024-25'
+        if not folder.exists():
+            self.skipTest('Private source documents are not distributed with public code')
+        excluded = {'2335_001.pdf', '2814_001.pdf', '2892_001.pdf',
+                    '3037_001.pdf', '3065_001.pdf'}
+        accepted = 0
+        for source in sorted(folder.iterdir()):
+            with self.subTest(report=source.name):
+                if source.name in excluded:
+                    with self.assertRaises(ValidationError):
+                        parse_report(source.read_bytes(), source.name)
+                else:
+                    parsed = parse_report(source.read_bytes(), source.name)
+                    self.assertGreater(len(parsed['records']), 0)
+                    self.assertEqual(parsed['controls']['count'], len(parsed['records']))
+                    self.assertFalse(any('marriage' in (r['permit_type'] or '').lower()
+                                         for r in parsed['records']))
+                    accepted += 1
+        self.assertEqual(accepted, 22)
+
+    def test_marriage_records_are_excluded_after_source_reconciliation(self):
+        parsed = parse_report(city(), 'weekly.csv')
+        marriage = copy.deepcopy(parsed['records'][0])
+        marriage.update(id='county:marriage', permit_type='Marriage License')
+        reconciled = {'records': [marriage], 'controls': {'count': 1}}
+        with patch('permit_data.parse_city_csv', return_value=reconciled):
+            with self.assertRaisesRegex(ValidationError, 'Marriage license documents are excluded'):
+                parse_report(b'fixture', 'marriage.csv')
+        reconciled = {'records': [parsed['records'][0], marriage], 'controls': {'count': 2}}
+        with patch('permit_data.parse_city_csv', return_value=reconciled):
+            result = parse_report(b'fixture', 'mixed.csv')
+        self.assertEqual(len(result['records']), 1)
+        self.assertEqual(result['controls']['marriage_records_excluded'], 1)
 
     def test_agricultural_certificate_and_broken_row_borders_reconcile(self):
         source = ROOT.parent / 'upload/Weekly ZO Permit Report 9.17.26 - 9.23.26.pdf'

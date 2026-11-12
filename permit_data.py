@@ -17,7 +17,7 @@ import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import ContentStream
 
-PARSER_VERSION = "1.2.0"
+PARSER_VERSION = "1.3.0"
 MUNICIPALITY_SOURCE = "https://www.revenue.wi.gov/Pages/UST/parcels.aspx"
 # Wisconsin Department of Revenue, La Crosse County parcel-prefix table.
 # Verified Nov. 9, 2026. Municipality is derived from the work parcel, never
@@ -57,6 +57,23 @@ class ValidationError(ValueError):
 
 def clean(value):
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def omit_formatted_phones(record):
+    """Redact recognizable contact tokens, preserving private originals."""
+    phone = r"(?:\(\d{3}\)\s*|\b\d{3}[-.])\d{3}[-.]\d{4}\b"
+    changed = False
+    for field in ('owner', 'contractor', 'company', 'description'):
+        value = record.get(field)
+        if isinstance(value, str) and (re.search(phone, value) or re.search(r'[\w.+-]+@[\w.-]+\.\w+', value)):
+            replacement = '[telephone omitted]' if field == 'description' else ''
+            value = re.sub(phone, replacement, value)
+            value = re.sub(r'[\w.+-]+@[\w.-]+\.\w+', '[email omitted]' if field == 'description' else '', value)
+            record[field] = clean(value) or None
+            changed = True
+    if changed:
+        record['notes'].append('Recognizable telephone or email contact details in the source text were omitted from public fields.')
+    return record
 
 
 def parse_date(value, required=False):
@@ -135,7 +152,7 @@ def parse_city_csv(raw: bytes, source_name: str):
         })
         if not re.match(r"\d", r["address"]):
             r["notes"].append("The source does not supply a street number.")
-        records.append(r)
+        records.append(omit_formatted_phones(r))
     if not records:
         raise ValidationError("Building CSV has no permit rows; review before removing records")
     dates = [r["issued_date"] for r in records]
@@ -235,12 +252,14 @@ def parse_county_pdf(raw: bytes, source_name: str):
     rows, control, by_type = [], None, None
     with pdfplumber.open(io.BytesIO(prepared)) as doc:
         head = doc.pages[0].extract_text() or ""
-        if "La Crosse County" not in head or "M5 New Permit Report" not in head:
+        if "La Crosse County" not in head or not any(title in head for title in ("M5 New Permit Report", "M5 Permit Report")):
             raise ValidationError("PDF is not the supported La Crosse County M5 permit report")
         period = re.search(r"From\s+(\d{1,2}/\d{1,2}/\d{4})\s+To\s+(\d{1,2}/\d{1,2}/\d{4})", head)
         if not period:
             raise ValidationError("County PDF lacks its reporting period")
         start, end = parse_date(period[1], True), parse_date(period[2], True)
+        if "M5 New Permit Report" not in head:
+            return parse_legacy_county(doc, start, end, source_name, removed)
         saw_header, columns = False, None
         for page_number, page in enumerate(doc.pages, 1):
             tables, columns = county_page_tables(page, columns)
@@ -283,11 +302,15 @@ def parse_county_pdf(raw: bytes, source_name: str):
                         rows[-1]["pages"].append(page_number)
     if not saw_header or control is None or by_type is None:
         raise ValidationError("County PDF is missing its column header or control summaries")
+    return finish_county_records(rows, control, by_type, start, end, source_name, removed)
+
+
+def finish_county_records(rows, control, by_type, start, end, source_name, removed, legacy=False):
     records = []
     for row in rows:
         c = row["cells"]
         department = clean(c[0])
-        if department not in ("Zoning Department", "Health Department", "Land Conservation"):
+        if department not in ("", "Zoning Department", "Health Department", "Land Conservation"):
             raise ValidationError("Unexpected county department")
         work = c[7].split("/", 1)
         if len(work) != 2 and clean(c[7]):
@@ -296,8 +319,8 @@ def parse_county_pdf(raw: bytes, source_name: str):
         number = clean(c[3])
         r = base_record("county-zoning", number or "UNREPORTED", parcel, source_name, allow_missing_parcel=True)
         r.update({
-            "category": "Zoning", "department": department,
-            "permit_type": clean(c[4]), "status": clean(c[5]),
+            "category": "Zoning", "department": department or None,
+            "permit_type": clean(c[4]), "status": clean(c[5]) or None,
             "application_date": parse_date(c[1]), "issued_date": parse_date(c[2], True),
             "address": address or "Not reported in source", "owner": owner_name(c[6]),
             # Contractor cells mix names, home/business addresses, phones and
@@ -322,13 +345,17 @@ def parse_county_pdf(raw: bytes, source_name: str):
             r['notes'].append('The source does not supply a work street address; no owner mailing address was substituted.')
         if not parcel:
             r['notes'].append('The source does not supply a work parcel; municipality is not inferred.')
-        if department != 'Zoning Department':
+        if not department:
+            r['notes'].append('The source does not supply a department for this record.')
+        elif department != 'Zoning Department':
             r['notes'].append('Source department: ' + department + '. Included in the county M5 report.')
         if not start <= r["issued_date"] <= end:
             raise ValidationError("County issue date is outside the report period")
-        if not r["status"] or not r["permit_type"]:
+        if (not r["status"] and not legacy) or not r["permit_type"]:
             raise ValidationError("Missing county permit type/status")
-        records.append(r)
+        if legacy:
+            r["notes"].append("Legacy report: legal address is linked to the work parcel; per-permit status is not supplied.")
+        records.append(omit_formatted_phones(r))
     validate_unique(records)
     observed = {"count": len(records), "fee_cents": sum(r["fee_cents"] or 0 for r in records),
                 "cost_cents": sum(r["project_cost_cents"] or 0 for r in records)}
@@ -336,6 +363,66 @@ def parse_county_pdf(raw: bytes, source_name: str):
         raise ValidationError(f"County PDF reconciliation failed: expected {control}, got {observed}")
     return {"records": records, "controls": {**control, "by_type": by_type,
             "clipped_header_wrappers_removed": removed}}
+
+
+
+LEGACY_PDF_FIELDS = ["Application Date", "Permit Date", "Permit Number", "Permit Close Date", "Permit Type", "Parcel Owner", "Legal Address", "Work PrintKey", "Work SWIS / Unique id", "Property Class", "Company", "Contractor", "Contractor Addr.", "Contractor Phone", "Work Description", "Square Footage", "Cost of Construction", "Fee Total", "Parcel Zone", "Flood Zone", "Flags"]
+
+
+def parse_legacy_county(doc, start, end, source_name, removed):
+    rows, control, by_type, columns = [], None, None, None
+    for page_number, page in enumerate(doc.pages, 1):
+        for found in page.find_tables():
+            table = found.extract()
+            if not table:
+                continue
+            if len(table[0]) == 4 and clean(table[0][0]).lower() == 'count by type':
+                by_type = {clean(row[0]): int(clean(row[1])) for row in table[2:] if clean(row[0]) and clean(row[0]) != 'Total:'}
+                continue
+            if len(table[0]) != 21:
+                continue
+            for index, row in enumerate(table):
+                if clean(row[0]) == 'Application Date':
+                    if [clean(v) for v in row] != LEGACY_PDF_FIELDS:
+                        raise ValidationError('Legacy county column layout changed')
+                    cells = found.rows[index].cells
+                    if any(cell is None for cell in cells):
+                        raise ValidationError('Legacy header column boundaries incomplete')
+                    columns = sorted({x for cell in cells for x in (cell[0], cell[2])})
+                    if len(columns) != 22:
+                        raise ValidationError('Legacy report must have 21 columns')
+            if columns is None:
+                raise ValidationError('Legacy county header missing')
+            if any(value is None for row in table for value in row):
+                fixed = page.crop(found.bbox).extract_tables({'vertical_strategy': 'explicit', 'explicit_vertical_lines': columns})
+                if len(fixed) != 1 or any(len(row) != 21 for row in fixed[0]):
+                    raise ValidationError('Legacy county border repair needs review')
+                table = fixed[0]
+            for row in table:
+                row = [v or '' for v in row]
+                if clean(row[0]) == 'Application Date':
+                    continue
+                if clean(row[0]) == 'Total:':
+                    if control is not None:
+                        raise ValidationError('Multiple legacy county detail totals')
+                    control = {'count': int(clean(row[2])), 'cost_cents': cents(row[16]), 'fee_cents': cents(row[17])}
+                    continue
+                if not any(clean(v) for v in row):
+                    continue
+                if clean(row[1]) or clean(row[2]):
+                    normalized = ['', row[0], row[1], row[2], row[4], '', row[5], row[7] + ' / ' + row[6], row[9], row[10], '', row[14], row[17], row[16], row[15], '', '', row[18], row[19], row[20]]
+                    rows.append({'cells': normalized, 'pages': [page_number]})
+                else:
+                    if not rows:
+                        raise ValidationError('Unrecognized legacy continuation row')
+                    mapping = {0:1, 4:4, 5:6, 6:7, 7:7, 9:8, 10:9, 14:11, 15:14, 16:13, 17:12, 18:17, 19:18, 20:19}
+                    for old, new in mapping.items():
+                        if row[old]:
+                            rows[-1]['cells'][new] += '\n' + row[old]
+                    rows[-1]['pages'].append(page_number)
+    if columns is None or control is None or by_type is None:
+        raise ValidationError('Legacy county header or control summaries missing')
+    return finish_county_records(rows, control, by_type, start, end, source_name, removed, legacy=True)
 
 
 def validate_unique(records):
@@ -361,6 +448,12 @@ def parse_report(raw, name):
             raise ValidationError("Only building CSV and county zoning PDF files are supported")
     except (csv.Error, KeyError, TypeError, IndexError) as exc:
         raise ValidationError(f"Report structure needs review: {type(exc).__name__}") from exc
+    marriage = [r for r in result['records'] if re.search(r'marriage', r.get('permit_type') or '', re.I)]
+    if marriage:
+        result['records'] = [r for r in result['records'] if r not in marriage]
+        result['controls']['marriage_records_excluded'] = len(marriage)
+        if not result['records']:
+            raise ValidationError('Marriage license documents are excluded; delete this upload from the review list.')
     return {**result, "sha256": hashlib.sha256(raw).hexdigest(), "parser_version": PARSER_VERSION}
 
 

@@ -123,6 +123,9 @@ class Cloudflare:
         except (ValueError, UnicodeError):
             raise ServiceError("invalid_private_state") from None
 
+    def delete_value(self, key):
+        self.request(self.kv + '/values/' + quote(key, safe=''), method='DELETE', missing_ok=True)
+
     def put_json(self, key, value):
         raw = json_bytes(value)
         if len(raw) > MAX_VALUE:
