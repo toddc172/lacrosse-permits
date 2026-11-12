@@ -2,7 +2,7 @@ name: Daily permit import
 
 on:
   schedule:
-    - cron: '17 7 * * *'
+    - cron: '17 5 * * *'
       timezone: America/Chicago
   workflow_dispatch:
 
