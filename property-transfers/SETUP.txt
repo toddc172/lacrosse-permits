@@ -1,0 +1,166 @@
+PROPERTY TRANSFER UPLOADER: ADDITION TO THE EXISTING PERMITS INFRASTRUCTURE
+Prepared Nov. 12, 2026. This package is prepared and tested locally, NOT DEPLOYED.
+
+WHAT THE PERMITS REPOSITORY CONFIRMED
+The existing design uses a shared-password Cloudflare Worker upload page,
+private Workers KV, a GitHub Actions importer, a static direct-upload Pages
+site, and a BLOX iframe. It does not use D1 or a live SQL service for readers.
+The uploaded repository ZIP omits the cloudflare/ Worker source, as documented
+in its README. This package supplies a separate transfer uploader based on the
+same KV metadata and publisher contract; it does not modify the live permits
+uploader. Existing Cloudflare transport, deployment verification and batch-hold
+logic are adapted from the supplied code. Permit-specific parsing is replaced.
+
+PACKAGE LAYOUT
+github-files/property-transfers/ : new folder for the existing GitHub repository
+github-files/.github/workflows/daily-transfers.yml : additional publishing job
+daily-transfers-workflow.txt : same workflow for GitHub's Create new file screen
+cloudflare/worker.js : self-contained Worker code for the Cloudflare editor
+cloudflare/wrangler.toml : optional command-line deployment configuration
+cloudflare-site.zip : EMPTY starter reader; safe for direct upload to Pages
+validation_results.json : local test results against all three private CSVs
+
+No original DOR CSV, real account identifier, password or token is included.
+The starter reader contains no records. The private monthly files are uploaded
+only through the staff page after setup, never into the public repository.
+
+ONE-TIME OWNER SETUP
+1. In the existing public toddc172/lacrosse-permits repository, add the entire
+   property-transfers folder from github-files. Retain its name and structure.
+   Do not overwrite the existing root web/ folder or permit Python files.
+   Add the workflow LAST, after the settings below are complete. The package
+   includes a workflow text copy because some file upload screens hide .github.
+
+2. In Cloudflare, create a separate Workers KV namespace named
+   lacrosse-property-transfers-files. Keep the permits namespace unchanged.
+   Create a new Worker named lacrosse-property-transfers-upload, using
+   cloudflare/worker.js in the code editor. Add a KV binding named FILES that
+   points to the new transfer namespace. Add these Worker secrets:
+     UPLOAD_PASSWORD : a new strong shared newsroom password, at least 16 characters
+     SESSION_SECRET  : a separate randomly generated secret, at least 32 characters
+   Store secrets in Cloudflare, not in code, GitHub files or chat. The Worker
+   fails closed until its namespace and both secrets are configured. Deploy
+   and copy the actual new workers.dev upload URL; the name may vary.
+   Optional CLI users can instead use worker.mjs/upload-page.mjs in the source
+   folder and its wrangler.toml, after filling the namespace ID. The dashboard
+   worker.js has the same page inlined and requires no additional module.
+
+3. Create a separate static Cloudflare Pages DIRECT-UPLOAD project, for example
+   lacrosse-tribune-property-transfers. Upload cloudflare-site.zip and deploy.
+   Do not connect an additional automatic Git build to this Pages project.
+   Copy the actual pages.dev reader URL. It initially says it is awaiting data.
+
+4. In the existing repository's Settings > Secrets and variables > Actions,
+   add these VARIABLES:
+     TRANSFERS_KV_NAMESPACE_ID : new transfer namespace ID
+     TRANSFERS_PAGES_PROJECT  : new transfer Pages project name
+   The workflow reuses CLOUDFLARE_ACCOUNT_ID and the existing
+   CLOUDFLARE_API_TOKEN secret. The token must permit KV read/write and Pages
+   deployment in this account; if the current token does not cover the new
+   resources, adjust its scope or use a separate token and workflow secret.
+   It never needs the newsroom upload password or session secret.
+
+5. Create .github/workflows/daily-transfers.yml in the repository, using the
+   exact contents of daily-transfers-workflow.txt. This job operates in the
+   property-transfers folder. It has its own concurrency group and uses the
+   free public-repository runner guard from the permits project. It runs at
+   7:37 a.m. America/Chicago and can also be started through Run workflow.
+   If simultaneous permits/transfers commits cause a git push conflict, rerun
+   the failed workflow after the other completes. The verified public JSON
+   remains available; uploads are not duplicated by a retry.
+
+6. Open the NEW transfer upload page, sign in and upload September's ORIGINAL
+   RETRHistoricalReport202609.csv. Click Review file. Expect 876 selected records:
+   La Crosse 321, Jackson 114, Trempealeau 97, Monroe 157, Vernon 131, Buffalo 56.
+   Click Approve for next import. Wait at least two minutes for KV propagation,
+   then run Daily property transfer import from GitHub Actions on main.
+   Check the job result, the new Pages reader and Published status on the upload
+   page. Expected first reader count: 876. Next upload August (832) and December
+   (811), then run again; the combined expected reader count is 2,519.
+   This live test has NOT been performed in the preparation environment.
+
+7. Adapt the iframe template below using the ACTUAL transfer Pages URL and
+   test it in a BLOX preview before publishing it to readers:
+   <iframe src="https://YOUR-TRANSFER-PROJECT.pages.dev" title="La Crosse region property transfers" style="width:100%;height:1100px;border:0" loading="lazy"></iframe>
+   Reuse the permits embed's site placement. The new site allows framing by
+   lacrossetribune.com and its subdomains. Other publication domains would need
+   an explicit update to the frame-ancestors policy in publish_transfers.py.
+
+ROUTINE STAFF PROCESS
+Download the monthly CSV from Wisconsin DOR. Open the transfer upload bookmark,
+sign in, select the original file, click Review file, inspect the six-county
+counts, then click Approve for next import. The file is queued, not immediately
+public. The daily job validates and publishes it; staff can refresh status.
+Routine staff do not need GitHub, Cloudflare, Python or spreadsheet editing.
+The initial review is a browser count check. The publishing job performs the
+authoritative schema, date, identity, numeric and duplicate checks afterward.
+With the shared password, approval is not attributed to an individual employee.
+
+WHY COMPRESSION IS INCLUDED
+The original permits importer has a 2 MiB source limit and 16 MiB transport/state
+limits. The DOR samples are 24,675,287 to 25,882,526 bytes; merely changing the
+parser would not work. Current Workers KV allows 25 MiB per value, leaving
+little headroom for uncompressed statewide reports. The page losslessly gzips
+the original in the browser, retaining the original filename and content.
+The samples compress to roughly 6.1-6.5 million bytes with Python gzip; browser
+compression can differ. The new compressed-upload limit is 8 MiB; the runner
+allows at most 64 MiB of decompressed input. Larger files stop for review.
+Source metadata hashes the compressed bytes; the private value is a gzip
+archive of the exact uploaded CSV. No statewide source is publicly deployed.
+Use a current Chrome or Edge browser with CompressionStream support.
+
+DATA RULES AND CORRECTIONS
+All six-county transfer types are retained. Sale price and estimated value are
+separate. Zero is not replaced with an estimate. Blank values stay blank. Names
+and parcel numbers preserve source text; dates are normalized. Mailing addresses,
+agent contacts, tax-bill addresses and financing details are excluded from the
+public data allowlist. Original reports remain private.
+
+The same accepted upload is idempotent. Two changed versions of one month or a
+county/document key repeated across months HOLD the batch for editor review.
+This first version deliberately does not automatically replace an accepted
+month, retract records, or merge corrections by latest upload time. A rejected,
+never-published source can be removed through the staff page. Published sources
+are protected. Remove rejected files only between publishing runs, allow about
+a minute for KV propagation, then rerun. Consult the editor before uploading
+a corrected version of an accepted month; an explicit replacement workflow is
+still future work. Corrections with their own document numbers remain separate.
+
+The source period is inferred only from the original filename and checked
+against statewide Recorded Date values. The current parser requires exactly
+the verified 78-column layout. A changed schema stops publication for review.
+All locally supplied samples satisfy these checks. The three included months
+are not a complete time series. Older category labels remain as reported.
+
+CAPACITY AND PUBLICATION LIMITS
+This preserves the existing free-account architecture; it does not guarantee
+unlimited free capacity. Account quotas are shared with permits and other apps.
+Do not accept a paid upgrade prompt to make an import pass. The code stops at
+its size/transport limits. It currently stores the cumulative public data and
+private parsed state in single values with a 16 MiB application cap; enough
+data will require sharding those snapshots and the reader data files. Check
+storage and payload sizes before a large historical backfill. No D1, R2 or
+paid service is required by this implementation.
+
+Publication uses staged static assets, exact production-JSON verification,
+then a private acknowledgement. If the post-deployment verification fails,
+new assets MAY already be live but uploads are not acknowledged; retry the job.
+Parser failures/conflicts happen before deployment and keep the prior site.
+
+LOCAL VALIDATION
+  cd property-transfers
+  python -m unittest discover -s tests -p test_transfers.py -q
+  node tests/test_worker.mjs
+Ten Python tests plus Worker checks cover parsing, public field selection,
+duplicate/conflicting uploads, retained history, failed deployment handling,
+authentication, origin checks, rejected removal and published-file protection.
+The browser CSV parser was exercised against all three supplied originals.
+An offline end-to-end publisher run reconciled 2,519 records. JavaScript syntax
+passed. Native browser layout, deployed Worker quotas, live Cloudflare/GitHub
+operation and BLOX acceptance remain to be verified during setup.
+
+REFERENCES
+https://www.revenue.wi.gov/Pages/RETR/Home.aspx
+https://developers.cloudflare.com/kv/platform/limits/
+https://developers.cloudflare.com/kv/platform/pricing/
+https://developers.cloudflare.com/pages/get-started/direct-upload/
