@@ -38,7 +38,9 @@ MAX_SOURCE = 8 * 1024 * 1024
 WRANGLER = "4.159.0"
 HEX = re.compile(r"[0-9a-f]{64}")
 CACHE_CHUNK_BYTES = 1024 * 1024
-MAX_CACHE_BYTES = 64 * 1024 * 1024
+MAX_CACHE_BYTES = 256 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
+PUBLIC_CHUNK_BYTES = 512 * 1024
 PUBLIC_KEYS = {"schema_version", "generated_at", "last_checked_at", "latest_recorded_date",
                "record_count", "source_count", "records", "included_months",
                "methodology", "import_status"}
@@ -89,8 +91,48 @@ def validate_public(data):
         validate_unique(data["records"])
     except Exception:
         raise ServiceError("public_field_validation_failed") from None
-    if len(json_bytes(data)) > MAX_VALUE:
+    if len(json_bytes(data)) > MAX_ARCHIVE_BYTES:
         raise ServiceError("public_dataset_capacity")
+
+
+def public_assets(data):
+    """Return a small index and content-addressed monthly record chunks."""
+    validate_public(data)
+    groups = {}
+    for record in data['records']:
+        month = record['source_month']
+        if not re.fullmatch(r'\d{4}-\d{2}', month):
+            raise ServiceError('invalid_source_month')
+        groups.setdefault(month, []).append(record)
+    assets, descriptors = {}, []
+    for month in sorted(groups, reverse=True):
+        rows, size, index = [], len(json_bytes({'schema_version': 1, 'records': []})), 0
+        def emit():
+            nonlocal rows, size, index
+            if not rows:
+                return
+            raw = json_bytes({'schema_version': 1, 'records': rows})
+            if len(raw) > PUBLIC_CHUNK_BYTES:
+                raise ServiceError('public_record_chunk_capacity')
+            index += 1
+            digest = hashlib.sha256(raw).hexdigest()
+            path = f'data/{month}-{index:05d}-{digest}.json'
+            assets[path] = raw
+            descriptors.append({'file': path, 'sha256': digest,
+                                'bytes': len(raw), 'record_count': len(rows)})
+            rows, size = [], len(json_bytes({'schema_version': 1, 'records': []}))
+        for row in groups[month]:
+            addition = len(json_bytes(row)) + 1
+            if rows and size + addition > PUBLIC_CHUNK_BYTES:
+                emit()
+            rows.append(row)
+            size += addition
+        emit()
+    index_data = {k: v for k, v in data.items() if k != 'records'}
+    index_data.update(schema_version=2, data_files=descriptors)
+    if len(json_bytes(index_data)) > MAX_VALUE:
+        raise ServiceError('public_index_capacity')
+    return index_data, assets
 
 
 def initial_dataset():
@@ -121,10 +163,17 @@ def write_site(folder, data, html_path):
                "  X-Content-Type-Options: nosniff\n"
                "  Referrer-Policy: no-referrer\n"
                "  Permissions-Policy: camera=(), microphone=(), geolocation=()\n"
-               "  Cache-Control: no-cache\n\n"
-               "/transfers.json\n  Cache-Control: no-store\n")
+               "\n/\n  Cache-Control: no-cache\n"
+               "\n/index.html\n  Cache-Control: no-cache\n"
+               "\n/transfers.json\n  Cache-Control: no-store\n"
+               "\n/data/*\n  Cache-Control: public, max-age=31536000, immutable\n")
     (folder / "index.html").write_text(html, encoding="utf-8")
-    (folder / "transfers.json").write_bytes(json_bytes(data))
+    index_data, assets = public_assets(data)
+    (folder / "transfers.json").write_bytes(json_bytes(index_data))
+    for name, raw in assets.items():
+        path = folder / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(raw)
     (folder / "_headers").write_text(headers, encoding="utf-8")
 
 
@@ -214,14 +263,20 @@ class Pages:
             raise ServiceError("pages_deployment_unavailable") from None
         if completed.returncode:
             raise ServiceError("pages_deployment_failed")
-        self.verify(project["hostname"], json_bytes(data))
+        # Verify each exact record chunk, then its index, before acknowledgement.
+        index_data, assets = public_assets(data)
+        for name, raw in assets.items():
+            self.verify(project['hostname'], raw, path=name)
+        self.verify(project["hostname"], json_bytes(index_data))
         return "https://" + project["hostname"]
 
-    def verify(self, hostname, expected):
+    def verify(self, hostname, expected, *, path='transfers.json'):
         if not re.fullmatch(r"[a-z0-9-]+\.pages\.dev", hostname):
             raise ServiceError("invalid_public_hostname")
         digest = hashlib.sha256(expected).hexdigest()
-        url = "https://" + hostname + "/transfers.json?publish=" + digest
+        if path != 'transfers.json' and not re.fullmatch(r'data/\d{4}-\d{2}-\d{5}-[a-f0-9]{64}\.json', path):
+            raise ServiceError('invalid_public_path')
+        url = "https://" + hostname + "/" + path + "?publish=" + digest
         opener = build_opener(PublicSiteRedirect())
         last_reason = "not_checked"
         for attempt in range(6):
@@ -297,7 +352,7 @@ def load_cache(api, descriptor):
                 or type(descriptor['bytes']) is not int
                 or not 0 < descriptor['bytes'] <= MAX_CACHE_BYTES
                 or not isinstance(descriptor['chunks'], list)
-                or not 0 < len(descriptor['chunks']) <= 128):
+                or not 0 < len(descriptor['chunks']) <= 512):
             raise ValueError()
         chunks = []
         packed_size = 0
@@ -328,9 +383,13 @@ def load_cache(api, descriptor):
 
 
 def prepare_state(api, files, data):
+    # Daily check timestamps belong in the small manifest, not a fresh full
+    # archive snapshot. Unchanged daily runs reuse their existing cache chunks.
+    stable_public = {k: v for k, v in data.items() if k != 'last_checked_at'}
     manifest = {'schema_version': 2,
                 'files': {ident: store_cache(api, entry) for ident, entry in files.items()},
-                'public': store_cache(api, data)}
+                'public': store_cache(api, stable_public),
+                'last_checked_at': data.get('last_checked_at')}
     if len(json_bytes(manifest)) > MAX_VALUE:
         raise ServiceError('private_manifest_capacity')
     return manifest
@@ -341,11 +400,19 @@ def read_state(api):
     if state is None:
         return {"schema_version": 1, "files": {}, "public": None}
     if isinstance(state, dict) and state.get('schema_version') == 2:
-        if set(state) != {'schema_version', 'files', 'public'} or not isinstance(state['files'], dict):
+        if (set(state) not in ({'schema_version', 'files', 'public'},
+                              {'schema_version', 'files', 'public', 'last_checked_at'})
+                or not isinstance(state['files'], dict)):
             raise ServiceError('invalid_private_state')
+        public = load_cache(api, state['public'])
+        if 'last_checked_at' in state:
+            checked = state['last_checked_at']
+            if checked is not None:
+                utc(checked)
+            public['last_checked_at'] = checked
         state = {'schema_version': 1,
                  'files': {ident: load_cache(api, descriptor) for ident, descriptor in state['files'].items()},
-                 'public': load_cache(api, state['public'])}
+                 'public': public}
     if (not isinstance(state, dict) or state.get("schema_version") != 1
             or not isinstance(state.get("files"), dict)):
         raise ServiceError("invalid_private_state")
@@ -540,7 +607,10 @@ def main():
         result = publish_daily(api, pages, root / "web/index.html")
         target = Path(opts.public_output)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(json_bytes(result["public"]))
+        # The repository keeps the verified small index. Record files are
+        # deployed to Pages; the private originals and caches remain in KV.
+        index_data, _ = public_assets(result['public'])
+        target.write_bytes(json_bytes(index_data))
         # Only counts and fixed messages go to the public workflow log.
         print(f"Published {result['public']['record_count']} validated transfer records.")
         return 0

@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import transfer_data as data
 from publish_transfers import publish_daily, initial_dataset, write_site, ServiceError
 from publish_transfers import read_state, store_cache, load_cache, json_bytes, STATE_KEY
+from publish_transfers import public_assets
 
 
 def source(month='2026-09', price='$100,000.00', document='123', extra=None):
@@ -153,6 +155,42 @@ class Tests(unittest.TestCase):
                 self.run_publish(api)
         self.assertEqual(api.values[STATE_KEY],previous)
         self.assertIn('storage preparation',api.values['control:status']['files'][new_id]['message'])
+    def test_public_chunks_reconcile_and_exclude_private_fields(self):
+        api=API();api.add('2026-09',source());api.add('2026-08',source('2026-08',document='122'))
+        result=self.run_publish(api)['public']
+        with patch('publish_transfers.PUBLIC_CHUNK_BYTES',1600):
+            index,assets=public_assets(result)
+        self.assertEqual(index['schema_version'],2);self.assertNotIn('records',index)
+        rows=[]
+        import json
+        for f in index['data_files']:
+            raw=assets[f['file']]
+            self.assertEqual(len(raw),f['bytes']);self.assertLessEqual(len(raw),1600)
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),f['sha256'])
+            part=json.loads(raw);self.assertEqual(len(part['records']),f['record_count'])
+            rows.extend(part['records'])
+        self.assertEqual(rows,result['records'])
+        self.assertTrue(all(set(r)==data.FIELDS for r in rows))
+    def test_previous_month_chunks_are_reused_when_month_added(self):
+        api=API();api.add('2026-09',source());first=self.run_publish(api)['public']
+        _,old_assets=public_assets(first)
+        api.add('2026-08',source('2026-08',document='122'));second=self.run_publish(api)['public']
+        _,new_assets=public_assets(second)
+        for name,raw in old_assets.items():self.assertEqual(new_assets[name],raw)
+    def test_record_larger_than_chunk_is_rejected(self):
+        api=API();api.add('2026-09',source());result=self.run_publish(api)['public']
+        with patch('publish_transfers.PUBLIC_CHUNK_BYTES',20):
+            with self.assertRaises(ServiceError):public_assets(result)
+    def test_daily_check_reuses_cache_and_record_assets(self):
+        api=API();api.add('2026-09',source());first=self.run_publish(api)['public']
+        keys={k for k in api.values if k.startswith('state:chunk:')}
+        _,old_assets=public_assets(first)
+        second=publish_daily(api,Pages(),self.html,now='2026-11-13T22:00:00Z')['public']
+        self.assertEqual(keys,{k for k in api.values if k.startswith('state:chunk:')})
+        self.assertEqual(public_assets(second)[1],old_assets)
+        self.assertEqual(read_state(api)['public']['last_checked_at'],'2026-11-13T22:00:00Z')
+    def test_public_reader_chunk_loading_and_failures(self):
+        subprocess.run(['node',str(Path(__file__).with_name('test_public_reader.mjs'))],check=True,capture_output=True,text=True)
 
 
 if __name__=='__main__':unittest.main()
