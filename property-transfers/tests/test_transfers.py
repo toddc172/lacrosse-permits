@@ -6,11 +6,13 @@ import io
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import transfer_data as data
 from publish_transfers import publish_daily, initial_dataset, write_site, ServiceError
+from publish_transfers import read_state, store_cache, load_cache, json_bytes, STATE_KEY
 
 
 def source(month='2026-09', price='$100,000.00', document='123', extra=None):
@@ -92,6 +94,65 @@ class Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             write_site(folder,initial_dataset(),self.html)
             self.assertEqual({p.name for p in Path(folder).iterdir()},{'index.html','_headers','transfers.json'})
+    def test_legacy_state_migrates_without_upload_or_record_loss(self):
+        api=API();ident=api.add('2026-09',source())
+        self.run_publish(api)
+        legacy=read_state(api)
+        api.values[STATE_KEY]=copy.deepcopy(legacy)
+        first=self.run_publish(api)
+        self.assertEqual(api.values[STATE_KEY]['schema_version'],2)
+        self.assertEqual(read_state(api)['files'],legacy['files'])
+        self.assertEqual(first['public']['records'],legacy['public']['records'])
+        self.assertFalse(first['changed'])
+        self.assertEqual(api.values['control:status']['files'][ident]['state'],'published')
+    def test_state_larger_than_single_value_publishes_and_reloads(self):
+        api=API();api.add('2026-09',source())
+        def bulk(raw,name):
+            parsed=data.parse_report(raw,name)
+            base=parsed['records'][0];parsed['records']=[]
+            for n in range(35):
+                row=copy.deepcopy(base);row['document_number']=str(10000+n);row['id']='la_crosse:'+row['document_number']
+                parsed['records'].append(row)
+            parsed['controls']['selected_rows']=len(parsed['records'])
+            return parsed
+        with patch('publish_transfers.MAX_VALUE',64*1024),patch('publish_transfers.CACHE_CHUNK_BYTES',256):
+            r=publish_daily(api,Pages(),self.html,now='2026-11-12T22:00:00Z',parser=bulk)
+            restored=read_state(api)
+            self.assertGreater(len(json_bytes(restored)),64*1024)
+            self.assertLess(len(json_bytes(r['public'])),64*1024)
+            self.assertEqual(len(restored['public']['records']),35)
+            self.assertEqual(api.values[STATE_KEY]['schema_version'],2)
+            self.assertTrue(all(len(json_bytes(value))<64*1024 for key,value in api.values.items() if not key.startswith('uploads/')))
+            self.assertFalse(publish_daily(api,Pages(),self.html,now='2026-11-12T22:00:00Z',parser=bulk)['changed'])
+    def test_missing_cache_chunk_fails_closed(self):
+        api=API();api.add('2026-09',source());self.run_publish(api)
+        prior=copy.deepcopy(api.values[STATE_KEY]);key=prior['public']['chunks'][0]
+        chunk=api.values.pop(key)
+        pages=Pages()
+        with self.assertRaises(ServiceError):self.run_publish(api,pages)
+        self.assertEqual(pages.calls,0);self.assertEqual(api.values[STATE_KEY],prior)
+        api.values[key]=chunk
+        self.assertEqual(read_state(api)['public']['record_count'],1)
+    def test_corrupt_cache_chunk_rejected(self):
+        api=API();descriptor=store_cache(api,{'sample':'original'})
+        api.values[descriptor['chunks'][0]]['data']='AAAA'
+        with self.assertRaises(ServiceError):load_cache(api,descriptor)
+    def test_prepared_chunks_do_not_accept_failed_deployment(self):
+        api=API();api.add('2026-09',source());self.run_publish(api)
+        previous=copy.deepcopy(api.values[STATE_KEY])
+        new_id=api.add('2026-08',source('2026-08',document='122'))
+        with self.assertRaises(ServiceError):self.run_publish(api,Pages(True))
+        self.assertEqual(api.values[STATE_KEY],previous)
+        self.assertEqual(read_state(api)['public']['record_count'],1)
+        self.assertEqual(api.values['control:status']['files'][new_id]['state'],'stored')
+    def test_capacity_error_updates_stale_status(self):
+        api=API();api.add('2026-09',source());self.run_publish(api)
+        previous=copy.deepcopy(api.values[STATE_KEY]);new_id=api.add('2026-08',source('2026-08',document='122'))
+        with patch('publish_transfers.prepare_state',side_effect=ServiceError('private_cache_item_capacity')):
+            with self.assertRaises(ServiceError):
+                self.run_publish(api)
+        self.assertEqual(api.values[STATE_KEY],previous)
+        self.assertIn('storage preparation',api.values['control:status']['files'][new_id]['message'])
 
 
 if __name__=='__main__':unittest.main()

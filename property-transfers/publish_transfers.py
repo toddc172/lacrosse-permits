@@ -37,6 +37,8 @@ STATUS_KEY = "control:status"
 MAX_SOURCE = 8 * 1024 * 1024
 WRANGLER = "4.159.0"
 HEX = re.compile(r"[0-9a-f]{64}")
+CACHE_CHUNK_BYTES = 1024 * 1024
+MAX_CACHE_BYTES = 64 * 1024 * 1024
 PUBLIC_KEYS = {"schema_version", "generated_at", "last_checked_at", "latest_recorded_date",
                "record_count", "source_count", "records", "included_months",
                "methodology", "import_status"}
@@ -259,10 +261,91 @@ class Pages:
         raise ServiceError("pages_production_verification_failed_" + last_reason)
 
 
+def store_cache(api, value):
+    """Write immutable compressed chunks before switching the current manifest.
+
+    Private originals, monthly parsed caches and the public snapshot remain
+    separate. An interrupted preparation leaves only unreferenced cache chunks.
+    """
+    raw = json_bytes(value)
+    if len(raw) > MAX_CACHE_BYTES:
+        raise ServiceError('private_cache_item_capacity')
+    packed = gzip.compress(raw, compresslevel=6, mtime=0)
+    packed_hash = hashlib.sha256(packed).hexdigest()
+    keys = []
+    for index, start in enumerate(range(0, len(packed), CACHE_CHUNK_BYTES)):
+        key = f'state:chunk:{packed_hash}:{index:05d}'
+        chunk = {'schema_version': 1, 'data': base64.b64encode(packed[start:start + CACHE_CHUNK_BYTES]).decode('ascii')}
+        existing = api.get_json(key)
+        if existing is None:
+            api.put_json(key, chunk)
+        elif existing != chunk:
+            raise ServiceError('immutable_cache_changed')
+        keys.append(key)
+    return {'schema_version': 1, 'encoding': 'gzip-base64',
+            'sha256': hashlib.sha256(raw).hexdigest(), 'gzip_sha256': packed_hash,
+            'bytes': len(raw), 'chunks': keys}
+
+
+def load_cache(api, descriptor):
+    try:
+        if (not isinstance(descriptor, dict) or set(descriptor) !=
+                {'schema_version', 'encoding', 'sha256', 'gzip_sha256', 'bytes', 'chunks'}
+                or descriptor['schema_version'] != 1 or descriptor['encoding'] != 'gzip-base64'
+                or not HEX.fullmatch(descriptor['sha256'])
+                or not HEX.fullmatch(descriptor['gzip_sha256'])
+                or type(descriptor['bytes']) is not int
+                or not 0 < descriptor['bytes'] <= MAX_CACHE_BYTES
+                or not isinstance(descriptor['chunks'], list)
+                or not 0 < len(descriptor['chunks']) <= 128):
+            raise ValueError()
+        chunks = []
+        packed_size = 0
+        for index, key in enumerate(descriptor['chunks']):
+            if key != f"state:chunk:{descriptor['gzip_sha256']}:{index:05d}":
+                raise ValueError()
+            chunk = api.get_json(key)
+            if (not isinstance(chunk, dict) or set(chunk) != {'schema_version', 'data'}
+                    or chunk['schema_version'] != 1 or not isinstance(chunk['data'], str)):
+                raise ValueError()
+            decoded = base64.b64decode(chunk['data'], validate=True)
+            if not 0 < len(decoded) <= CACHE_CHUNK_BYTES:
+                raise ValueError()
+            packed_size += len(decoded)
+            if packed_size > MAX_CACHE_BYTES + 1024 * 1024:
+                raise ValueError()
+            chunks.append(decoded)
+        packed = b''.join(chunks)
+        if hashlib.sha256(packed).hexdigest() != descriptor['gzip_sha256']:
+            raise ValueError()
+        with gzip.GzipFile(fileobj=io.BytesIO(packed)) as stream:
+            raw = stream.read(descriptor['bytes'] + 1)
+        if len(raw) != descriptor['bytes'] or hashlib.sha256(raw).hexdigest() != descriptor['sha256']:
+            raise ValueError()
+        return strict_json(raw)
+    except (ValueError, TypeError, KeyError, OSError, EOFError):
+        raise ServiceError('invalid_private_cache') from None
+
+
+def prepare_state(api, files, data):
+    manifest = {'schema_version': 2,
+                'files': {ident: store_cache(api, entry) for ident, entry in files.items()},
+                'public': store_cache(api, data)}
+    if len(json_bytes(manifest)) > MAX_VALUE:
+        raise ServiceError('private_manifest_capacity')
+    return manifest
+
+
 def read_state(api):
     state = api.get_json(STATE_KEY)
     if state is None:
         return {"schema_version": 1, "files": {}, "public": None}
+    if isinstance(state, dict) and state.get('schema_version') == 2:
+        if set(state) != {'schema_version', 'files', 'public'} or not isinstance(state['files'], dict):
+            raise ServiceError('invalid_private_state')
+        state = {'schema_version': 1,
+                 'files': {ident: load_cache(api, descriptor) for ident, descriptor in state['files'].items()},
+                 'public': load_cache(api, state['public'])}
     if (not isinstance(state, dict) or state.get("schema_version") != 1
             or not isinstance(state.get("files"), dict)):
         raise ServiceError("invalid_private_state")
@@ -394,8 +477,7 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
     if not files and not previous.get('public'):
         api.put_json(STATUS_KEY, status_record(previous, uploaded, now))
         raise ServiceError("no_reports_uploaded")
-    # Each upload version is a historical source. Latest upload wins per permit ID.
-    # An omitted permit is NOT an automatic deletion of historical public records.
+    # Preserve accepted source history; hold conflicting months/documents for review.
     try:
         data = public_dataset(files, generated_at=now)
     except ValueError:
@@ -409,12 +491,21 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
     if not changed:
         data["generated_at"] = prior_public["generated_at"]
     data.update(last_checked_at=now, import_status="published")
-    validate_public(data)
-    state = {"schema_version": 1, "files": files, "public": data}
-    if len(json_bytes(state)) > MAX_VALUE:
-        raise ServiceError("private_state_capacity")
     try:
-        with tempfile.TemporaryDirectory(prefix="permits-site-") as temp:
+        validate_public(data)
+    except ServiceError:
+        api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
+                     message='The public dataset reached a size or validation limit. The previous public data was kept; ask the editor to check the workflow error.'))
+        raise
+    state = {"schema_version": 1, "files": files, "public": data}
+    try:
+        manifest = prepare_state(api, files, data)
+    except ServiceError:
+        api.put_json(STATUS_KEY, status_record(previous, uploaded, now,
+                     message='Import storage preparation was interrupted. The previous public data was kept; ask the editor to check the workflow error.'))
+        raise
+    try:
+        with tempfile.TemporaryDirectory(prefix="transfers-site-") as temp:
             folder = Path(temp).resolve()
             write_site(folder, data, html_path)
             public_url = pages.publish(folder, data)
@@ -424,7 +515,7 @@ def publish_daily(api, pages, html_path, *, now=None, parser=parse_report):
         raise
     # Only acknowledge after the exact production JSON is verified. If either KV
     # write fails, retries are safe because every original is immutable and retained.
-    api.put_json(STATE_KEY, state)
+    api.put_json(STATE_KEY, manifest)
     api.put_json(STATUS_KEY, status_record(state, uploaded, now))
     return {"public": data, "public_url": public_url, "changed": changed}
 
