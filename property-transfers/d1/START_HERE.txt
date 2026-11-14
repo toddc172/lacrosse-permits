@@ -46,7 +46,7 @@ OWNER SETUP
    D1 reader preview. Before initialization it may report that setup is not
    complete; after imports it shows only fully activated source months.
    Check names, parcels, county/date/price filters, next/previous pages, details,
-   and matching CSV export. Counts increase as migration proceeds. The job's
+   and result details. Counts increase as migration proceeds. The job's
    pilot audit compares each migrated source's count and fingerprint with the
    old published state. Missing source months are printed in the workflow log.
 8. Repeat pilot runs as the daily budget allows, with initialize unchecked.
@@ -102,7 +102,7 @@ the public reader retains the requested oldest/newest dates instead of a month
 list. Historical schema changes stop for mapping review. The current uploader's
 8 MiB compressed and parser's 64 MiB uncompressed source limits still apply.
 
-PUBLIC SEARCH AND EXPORT
+PUBLIC SEARCH
 Search is performed by the read-only Worker against D1. Normal responses contain
 25 records, not the entire archive. Next/previous use stable cursors; revisions
 prevent a changed dataset from silently mixing pages. Filtering/sorting use
@@ -116,12 +116,6 @@ rather than scanning the whole database for an exact count on every keystroke.
 The heading retains the exact total, oldest/newest dates and update time from
 the maintained summary. Read-only responses may be cached for 30 seconds;
 the reader checks metadata once a minute. Failed searches keep the prior rows.
-
-Download matching CSV intentionally fetches matching records in 100-row pages
-only when requested. An export stops if the dataset revision changes. The
-current export cap is 100,000 records; larger exports need a narrower date
-range. It never downloads a silently truncated or mixed-revision partial file.
-CSV values that could be interpreted as spreadsheet formulas are escaped.
 
 PRIVATE STORAGE AND LONG-TERM CAPACITY
 D1 becomes the working database. It does not create another full-archive JSON
