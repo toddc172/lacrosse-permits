@@ -1,0 +1,9 @@
+name = "lacrosse-property-transfers-search"
+main = "search-worker.mjs"
+compatibility_date = "2026-11-13"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lacrosse-property-transfers"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

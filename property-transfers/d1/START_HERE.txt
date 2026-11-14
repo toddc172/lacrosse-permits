@@ -1,0 +1,178 @@
+PROPERTY TRANSFERS: D1 TEST TRANSITION
+Prepared Nov. 13, 2026. Code is prepared and locally tested; no D1 resource,
+token, Worker, GitHub file or existing Pages deployment was changed here.
+
+FIRST STEP
+In Cloudflare, open Storage & databases > D1 SQL Database and create an empty
+database named lacrosse-property-transfers. Keep the existing uploader and KV
+namespace. Copy the D1 database ID (a UUID, different from the KV namespace ID).
+We can then walk through the remaining setup one screen at a time.
+
+PACKAGE
+Upload the d1 FOLDER into property-transfers in the existing GitHub repository.
+This is an addition: existing root parsers, uploader, static reader and publisher
+files stay in place. The folder contains the schema, incremental importer,
+read-only search Worker, reader, deployment tool, tests and workflow reference.
+The separate property-transfers-d1-workflow.txt is for GitHub's Create new file
+screen. No original CSV, real identifier, password or token is included.
+
+OWNER SETUP
+1. Create the D1 database above and add the d1 folder to GitHub.
+2. Create a separate Cloudflare Worker named lacrosse-property-transfers-search.
+   Start with Hello World, deploy, then Edit code. Replace the starter with the
+   complete contents of d1/dashboard-worker.js and deploy. Add a D1 binding
+   named DB pointing to lacrosse-property-transfers. This public search Worker
+   does not need the newsroom upload password or a database API token.
+3. In GitHub Settings > Secrets and variables > Actions, add VARIABLES:
+     TRANSFERS_D1_DATABASE_ID = the new D1 database UUID
+     TRANSFERS_D1_API_URL = the ACTUAL new search Worker HTTPS address, e.g.
+       https://lacrosse-property-transfers-search.todd-krysiak.workers.dev
+   Leave TRANSFERS_D1_ENABLED unset for initial manual testing.
+4. Create a Cloudflare API token with D1 write permission for this account.
+   Store it as GitHub SECRET TRANSFERS_D1_API_TOKEN. Keep it out of code/chat.
+   The existing CLOUDFLARE_API_TOKEN remains the KV/Pages credential. The new
+   workflow reuses the account ID, transfer KV namespace and Pages project
+   variables already present. It does not use the permits namespace or project.
+5. In GitHub, create .github/workflows/property-transfers-d1.yml with the exact
+   contents of property-transfers-d1-workflow.txt. This new workflow uses the
+   same transfers-production concurrency group, so it serializes with the old
+   transfer publisher. It does not conflict with the separate permits workflow.
+6. Actions > Property transfers D1 > Run workflow. Choose action pilot, check
+   initialize on the FIRST run only, then run on main. Initialization creates
+   the schema and indexes; it does not drop tables. The pilot reads already
+   published records from existing private state and migrates up to three
+   source months per run. It does not deploy Pages or change upload statuses.
+7. Open the NEW search Worker URL on desktop and phone. Its root serves the
+   D1 reader preview. Before initialization it may report that setup is not
+   complete; after imports it shows only fully activated source months.
+   Check names, parcels, county/date/price filters, next/previous pages, details,
+   and matching CSV export. Counts increase as migration proceeds. The job's
+   pilot audit compares each migrated source's count and fingerprint with the
+   old published state. Missing source months are printed in the workflow log.
+8. Repeat pilot runs as the daily budget allows, with initialize unchecked.
+   A green job may say PAUSED rather than complete: inspect the log. A quota
+   pause keeps partial rows hidden and resumes without rewriting them after
+   the daily reset. Use the audit's missing source count to judge completion.
+
+REPLACE THE TEST READER AND ENABLE REGULAR D1 IMPORTS
+The existing site is a test environment, so no live-cutover gate is imposed.
+Once the D1 preview is useful, it can replace the current test reader even if
+older months are still being imported. Its count and dates describe the D1
+records actually loaded. No claim of a complete history is inferred.
+
+9. Disable ONLY the old Daily property transfer import workflow in Actions
+   (daily-transfers.yml). Keep Daily permit import running. Disabling the old
+   transfer publisher prevents it from overwriting the D1 reader with the
+   previous static reader. No programmatic permission/approval gate is required.
+10. In the new Property transfers D1 workflow, run action deploy-reader with
+    initialize unchecked. It compares the search service's summary with D1,
+    deploys the reader to the EXISTING transfer Pages project and verifies its
+    public HTML/config. The Pages address and BLOX embed remain the same.
+11. Run action production to process the uploader's queued originals. This mode
+    reads sources not yet active in D1, validates, stages and reconciles them,
+    activates completed source months and updates the existing upload history.
+    Existing files do not need reuploading. Choose production for later manual
+    import runs; pilot is the comparison tool for the older static baseline.
+12. Add GitHub VARIABLE TRANSFERS_D1_ENABLED with value true. The new workflow
+    then runs production at 7:37 a.m. America/Chicago. Routine staff still use
+    Choose File > Review file > Approve for next import, without GitHub access.
+
+BACKFILL AND RESUMABILITY
+The initial code processes up to three newly completed months per run and uses
+a conservative app budget of 35,000 D1 rows written / 1,000,000 rows read per UTC
+day. Index and full-text maintenance contribute to D1 write metrics. The ledger
+persists in existing KV; interrupted inserts resume from stored row hashes.
+The first large migration/backfill may take multiple days on free allowances.
+After the first measured run, the budget/batch size can be tuned against actual
+account usage. No plan is upgraded automatically and no paid service is added.
+These budgets are not an account-wide reservation: other D1 usage and searches
+share Cloudflare's quotas. Check the live metrics; quota errors stop the run.
+
+Only fully reconciled months appear in public searches. Source-month conflicts
+and repeated county/document identities are held for editorial review; accepted
+months are not silently overwritten. Deleting a rejected, never-published file
+through the existing upload page marks it removed. The D1 importer then clears
+only that source's never-active staged rows and month reservation on a later
+run. Active D1 months cannot be retracted by such a marker. Replacing accepted
+months remains an editor-managed process, as in the previous implementation.
+
+The workflow prints missing source months from January 2021 through the newest
+active record month. Use this internal ledger to verify a complete backfill;
+the public reader retains the requested oldest/newest dates instead of a month
+list. Historical schema changes stop for mapping review. The current uploader's
+8 MiB compressed and parser's 64 MiB uncompressed source limits still apply.
+
+PUBLIC SEARCH AND EXPORT
+Search is performed by the read-only Worker against D1. Normal responses contain
+25 records, not the entire archive. Next/previous use stable cursors; revisions
+prevent a changed dataset from silently mixing pages. Filtering/sorting use
+bound parameters and fixed allowlists. Word-prefix search covers reported
+names, addresses, parcels, municipalities and counties; this replaces the old
+arbitrary-substring search. Single-letter-only searches are rejected to avoid
+unnecessarily broad full-text work. Two-letter names remain searchable.
+
+The reader's result label shows the page's range and whether more are available,
+rather than scanning the whole database for an exact count on every keystroke.
+The heading retains the exact total, oldest/newest dates and update time from
+the maintained summary. Read-only responses may be cached for 30 seconds;
+the reader checks metadata once a minute. Failed searches keep the prior rows.
+
+Download matching CSV intentionally fetches matching records in 100-row pages
+only when requested. An export stops if the dataset revision changes. The
+current export cap is 100,000 records; larger exports need a narrower date
+range. It never downloads a silently truncated or mixed-revision partial file.
+CSV values that could be interpreted as spreadsheet formulas are escaped.
+
+PRIVATE STORAGE AND LONG-TERM CAPACITY
+D1 becomes the working database. It does not create another full-archive JSON
+snapshot on every update. The old snapshots remain untouched in KV during this
+test transition. Once D1 and source backups are verified, obsolete processing
+caches can be audited and retired separately. This package deletes no original
+or old snapshot. Keep a backup before any later cleanup.
+
+The full implemented schema, payloads, FTS and indexes used 6,610,944 bytes for
+the three actual sample months (2,519 records) in local SQLite. Straight-line
+projection is about 152 MB for 69 similarly sized months, compared with D1's
+current Free limit of 500 MB per database. This supersedes the earlier ~56 MB
+estimate from the leaner exploratory schema. Actual D1 size, historical volume,
+staged records and fragmentation need measurement. The prototype is not a
+guarantee of future storage, traffic or CPU capacity.
+
+Compressed statewide originals still average about 6.4 MB/month in the samples,
+about 440 MB for 69 months. Existing KV account storage is shared with other
+apps and old caches. Monitor it before a full backfill; plan a verified archive
+and cache-retirement policy as it grows. Do not delete accepted sources merely
+to make a quota error disappear. D1 Free daily read/write quotas and Workers
+Free request/CPU limits also apply; indexed search and small result pages help,
+but live usage and broad searches still need observation.
+
+DEVELOPMENT / TESTS
+From property-transfers:
+  python -m unittest discover -s d1/tests -p test_d1.py -q
+  node d1/tests/test_worker.mjs
+  python -m unittest discover -s tests -p test_transfers.py -q
+Local tests cover all 2,519 actual sample records, staged invisibility, resumable
+imports, duplicates/conflicts, deleted staging, published protection, FTS,
+parameterized filters, keyset pagination for date/price/null values, read-only
+API behavior, revisions, reader failures, and a mocked Pages deployment.
+The API's HTTP contract follows current Cloudflare docs. Actual token scopes,
+live D1 query behavior/metrics, Worker CPU time and phone/BLOX rendering still
+need testing after the owner creates/configures the resources.
+
+To edit the reader, change d1/preview/index.html and run python d1/build_worker.py.
+Redeploy the generated dashboard-worker.js to the SEARCH Worker and use
+deploy-reader to update the existing Pages reader. Do not paste search code
+into the existing upload Worker. CLI deployment users may use wrangler.toml,
+search-worker.mjs and reader.mjs after filling the new database UUID.
+
+ROLLBACK DURING TESTING
+Disable the new D1 schedule (TRANSFERS_D1_ENABLED=false). Re-enable and run the
+old Daily property transfer import to rebuild its static reader from retained
+KV originals/state. No rollback tool drops D1 data. Keep the old publisher and
+sources until this test transition and backups have been verified.
+
+REFERENCES
+https://developers.cloudflare.com/d1/platform/limits/
+https://developers.cloudflare.com/d1/platform/pricing/
+https://developers.cloudflare.com/d1/sql-api/sql-statements/
+https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/

@@ -1,0 +1,71 @@
+name: Property transfers D1
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Choose pilot import, test-reader deployment or regular synchronization
+        type: choice
+        options: [pilot, deploy-reader, production]
+        default: pilot
+      initialize:
+        description: Initialize the new D1 schema (first run only)
+        type: boolean
+        default: false
+  schedule:
+    - cron: '37 7 * * *'
+      timezone: America/Chicago
+
+permissions: {}
+concurrency:
+  group: transfers-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: property-transfers
+
+jobs:
+  d1:
+    if: >-
+      github.event.repository.private == false &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'workflow_dispatch' || vars.TRANSFERS_D1_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: actions/setup-python@v6.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Test staged imports, reconciliation and SQL searches
+        run: python -m unittest discover -s d1/tests -p test_d1.py -q
+      - name: Test public read-only API and reader
+        run: node d1/tests/test_worker.mjs
+      - name: D1 pilot, synchronization or test-reader deployment
+        env:
+          TRANSFERS_D1_ACTION: ${{ github.event_name == 'schedule' && 'production' || inputs.action }}
+          TRANSFERS_D1_INITIALIZE: ${{ inputs.initialize }}
+          TRANSFERS_PUBLIC_REPOSITORY: 'true'
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_KV_NAMESPACE_ID: ${{ vars.TRANSFERS_KV_NAMESPACE_ID }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ vars.TRANSFERS_PAGES_PROJECT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TRANSFERS_D1_DATABASE_ID: ${{ vars.TRANSFERS_D1_DATABASE_ID }}
+          TRANSFERS_D1_API_URL: ${{ vars.TRANSFERS_D1_API_URL }}
+          TRANSFERS_D1_API_TOKEN: ${{ secrets.TRANSFERS_D1_API_TOKEN }}
+        run: |
+          init_args=()
+          if [ "$TRANSFERS_D1_INITIALIZE" = 'true' ]; then init_args+=(--init); fi
+          case "$TRANSFERS_D1_ACTION" in
+            pilot) python d1/sync_d1.py --mode pilot --audit --max-months 3 "${init_args[@]}" ;;
+            production) python d1/sync_d1.py --mode production --max-months 3 "${init_args[@]}" ;;
+            deploy-reader) python d1/deploy_reader.py ;;
+            *) exit 1 ;;
+          esac
