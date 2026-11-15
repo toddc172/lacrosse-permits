@@ -187,8 +187,15 @@ def report_coverage(db):
     print(f'D1 totals: {summary["record_count"]} records, {summary["source_count"]} source months. Missing months since 2021-01: {len(missing)}.')
     if missing:print('Missing source months: '+', '.join(missing))
 
+def run_batches(api,db,mode,max_months,until_budget):
+    total=0
+    while True:
+        count=synchronize(api,db,mode,max_months)
+        total+=count
+        if not until_budget or count<max_months:return total
+
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--mode',choices=['pilot','production'],default='pilot');parser.add_argument('--max-months',type=int,default=3);parser.add_argument('--init',action='store_true');parser.add_argument('--audit',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--mode',choices=['pilot','production'],default='pilot');parser.add_argument('--max-months',type=int,default=3);parser.add_argument('--init',action='store_true');parser.add_argument('--audit',action='store_true');parser.add_argument('--until-budget',action='store_true');args=parser.parse_args()
     if not 1<=args.max_months<=12:parser.error('max-months must be 1 to 12')
     if os.environ.get('GITHUB_ACTIONS')!='true' or os.environ.get('TRANSFERS_PUBLIC_REPOSITORY')!='true':raise ServiceError('run_only_in_public_repository_workflow')
     api=Cloudflare(os.environ.get('CLOUDFLARE_ACCOUNT_ID',''),os.environ.get('CLOUDFLARE_KV_NAMESPACE_ID',''),os.environ.get('CLOUDFLARE_API_TOKEN',''))
@@ -196,10 +203,24 @@ def main():
     db=D1(api.account,os.environ.get('TRANSFERS_D1_DATABASE_ID',''),os.environ.get('TRANSFERS_D1_API_TOKEN',''),usage)
     try:
         if args.init:db.query(Path(__file__).with_name('schema.sql').read_text())
-        count=synchronize(api,db,args.mode,args.max_months)
+        baseline=None;completion_key='d1:migration:complete'
+        if args.mode=='pilot' and args.audit:
+            source_state=api.get_json('state:current')
+            if not isinstance(source_state,dict) or not isinstance(source_state.get('files'),dict):raise ServiceError('pilot_baseline_unavailable')
+            baseline=digest(source_state['files'])
+            completed=api.get_json(completion_key)
+            if (isinstance(completed,dict) and completed.get('database_id')==os.environ.get('TRANSFERS_D1_DATABASE_ID') and completed.get('baseline_fingerprint')==baseline):
+                summary=json.loads(db.query("SELECT value FROM settings WHERE name='public'")[0]['value'])
+                if summary.get('revision')==completed.get('revision'):
+                    print('Pilot migration already reconciled completely. No further import work is needed for this baseline.');return 0
+        count=run_batches(api,db,args.mode,args.max_months,args.until_budget)
         if args.audit:
             if args.mode!='pilot':raise ServiceError('audit_is_for_pilot_only')
-            audit_pilot(api,db)
+            complete=audit_pilot(api,db)
+            if complete:
+                summary=json.loads(db.query("SELECT value FROM settings WHERE name='public'")[0]['value'])
+                api.put_json(completion_key,{'schema_version':1,'database_id':os.environ.get('TRANSFERS_D1_DATABASE_ID'),'baseline_fingerprint':baseline,'revision':summary['revision'],'completed_at':dt.datetime.now(dt.timezone.utc).isoformat()})
+                print('Pilot migration COMPLETE: every baseline source reconciled. Future pilot runs will skip this unchanged baseline.')
         report_coverage(db)
         print(f'D1 {args.mode}: activated {count} source months. Import usage: {db.usage["rows_read"]} rows read; {db.usage["rows_written"]} rows written today.')
     except BudgetPause:

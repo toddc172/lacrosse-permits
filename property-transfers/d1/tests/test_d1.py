@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 D1ROOT=Path(__file__).resolve().parents[1];ROOT=D1ROOT.parent
 sys.path.insert(0,str(ROOT));sys.path.insert(0,str(D1ROOT))
-from sync_d1 import import_month,synchronize,BudgetPause,clean_removed_staging,D1
+from sync_d1 import import_month,synchronize,BudgetPause,clean_removed_staging,D1,run_batches
 from cloudflare_client import ServiceError
 from transfer_data import parse_report,public_dataset,PARSER_VERSION
 from deploy_reader import write_reader,api_origin
@@ -158,5 +158,28 @@ class Tests(unittest.TestCase):
         client.usage['rows_written']=35000
         with self.assertRaises(BudgetPause):client.query('INSERT INTO t VALUES(?)',[1])
         self.assertEqual(len(captured),1)
+    def test_until_budget_runs_successive_batches(self):
+        with patch('sync_d1.synchronize',side_effect=[3,3,2]) as sync:
+            self.assertEqual(run_batches(None,None,'pilot',3,True),8)
+            self.assertEqual(sync.call_count,3)
+    def test_until_budget_stops_immediately_at_safeguard(self):
+        with patch('sync_d1.synchronize',side_effect=[3,BudgetPause()]) as sync:
+            with self.assertRaises(BudgetPause):run_batches(None,None,'pilot',3,True)
+            self.assertEqual(sync.call_count,2)
+    def test_manual_single_batch_remains_supported(self):
+        with patch('sync_d1.synchronize',return_value=3) as sync:
+            self.assertEqual(run_batches(None,None,'pilot',3,False),3)
+            self.assertEqual(sync.call_count,1)
+    def test_completed_automatic_migration_is_not_repeated(self):
+        import sync_d1
+        meta,records,api=entry();api.account='a'*32
+        parsed=parse_report(api.values['uploads/'+meta['id']],meta['name'])
+        api.values['state:current']={'schema_version':1,'files':{meta['id']:{'metadata':meta,'modified':meta['uploaded_at'],'parser_version':PARSER_VERSION,'records':records,'controls':parsed['controls']}},'public':None}
+        self.db.usage={'rows_read':0,'rows_written':0}
+        with patch.dict('os.environ',{'GITHUB_ACTIONS':'true','TRANSFERS_PUBLIC_REPOSITORY':'true','TRANSFERS_D1_DATABASE_ID':'11111111-1111-1111-1111-111111111111'}),patch.object(sync_d1,'Cloudflare',lambda *args:api),patch.object(sync_d1,'D1',lambda *args:self.db),patch.object(sys,'argv',['sync_d1.py','--mode','pilot','--audit','--until-budget']):
+            self.assertEqual(sync_d1.main(),0)
+            self.assertIn('d1:migration:complete',api.values)
+            with patch.object(sync_d1,'run_batches',side_effect=AssertionError('Completed baseline must not reimport')):
+                self.assertEqual(sync_d1.main(),0)
 
 if __name__=='__main__':unittest.main()
