@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "schemas": {
+    "city-v1": {
+      "fields": [
+        "PermitNumber",
+        "PermitType",
+        "PermitWorkClass",
+        "ProjectCost",
+        "ProjectDescription",
+        "ParcelNumber",
+        "PermitAddress",
+        "Owner",
+        "Contractor",
+        "PermitApplyDate",
+        "PermitIssueDate"
+      ],
+      "aliases": {
+        "PermitNumber": [
+          "Permit Number",
+          "Permit No."
+        ]
+      }
+    },
+    "county-modern-v1": {
+      "fields": [
+        "Department",
+        "Application Date",
+        "Permit Date",
+        "Permit Number",
+        "Permit Type",
+        "Permit Status",
+        "Parcel Owner",
+        "Work Printkey / Address",
+        "Use Group",
+        "Company",
+        "Contractor",
+        "Work Description",
+        "Fee Total",
+        "Cost of Construction",
+        "Sq Footage",
+        "Expiration Date",
+        "Days Inactive",
+        "Parcel Zone",
+        "Flood Zone",
+        "Flags"
+      ],
+      "aliases": {
+        "Permit Number": [
+          "Permit No."
+        ]
+      }
+    },
+    "county-legacy-v1": {
+      "fields": [
+        "Application Date",
+        "Permit Date",
+        "Permit Number",
+        "Permit Close Date",
+        "Permit Type",
+        "Parcel Owner",
+        "Legal Address",
+        "Work PrintKey",
+        "Work SWIS / Unique id",
+        "Property Class",
+        "Company",
+        "Contractor",
+        "Contractor Addr.",
+        "Contractor Phone",
+        "Work Description",
+        "Square Footage",
+        "Cost of Construction",
+        "Fee Total",
+        "Parcel Zone",
+        "Flood Zone",
+        "Flags"
+      ],
+      "aliases": {
+        "Permit Number": [
+          "Permit No."
+        ]
+      }
+    }
+  }
+}

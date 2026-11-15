@@ -10,7 +10,7 @@ All 17 additional PDFs supplied for the backfill now reconcile locally, includin
 
 Missing source numbers stay explicitly unreported, with an internal matching hash based on reported type, dates and work location. Blank work addresses are displayed as unreported; owner mailing addresses are never substituted. Missing work parcels leave municipality unreported. These are source limitations, not inferred corrections.
 
-Source departments are retained explicitly, including Health Department and Land Conservation entries contained in the county M5 reports. The reader labels this category County reports and shows/exports the source department. The stored category key remains Zoning for compatibility with saved filters. Validated continuation fragments are joined before department/date/location checks. Unknown departments and unreconciled totals still stop publication. Staff review messages now describe fixed problem categories privately without copying raw exception text into public logs.
+Source departments are retained explicitly, including Health Department and Land Conservation entries contained in the county M5 reports. The reader labels this category County reports and shows the source department. The stored category key remains Zoning for compatibility with saved filters. Validated continuation fragments are joined before department/date/location checks. Unknown departments and unreconciled totals still stop publication. Staff review messages now describe fixed problem categories privately without copying raw exception text into public logs.
 
 The batch repair ZIP contains two Python files plus `web/` and `tests/` folders. Upload all four items into the existing GitHub repository root, retaining the supplied paths. No raw PDF, CSV, credential or private snapshot is included. Start a new workflow run on main after committing. Live processing of the complete Cloudflare archive remains to be confirmed.
 
@@ -38,13 +38,13 @@ The repository and final permit JSON are public. Original CSV/PDF reports, owner
 
 7. If repository workflow permissions require it, allow **Read and write permissions** under **Settings → Actions → General → Workflow permissions**. The workflow requests `contents: write` solely to save the already-public, validated JSON and its daily check time. A branch rule blocking this bot's commits requires an approved repository configuration; the code does not bypass branch protection.
 8. Add `.github/workflows/daily-permits.yml` on the default branch. In **Actions → Daily permit import → Run workflow**, select that branch and run it. The first successful run should publish **41 permits: 29 building and 12 zoning**, assuming the two original reports are still the only uploads. The county controls are $131,159.58 in reported construction costs and $2,850 in fees. The upload page should then show Published instead of Stored.
-9. Open the actual Pages address. Check the work locations, filters, details, exports and a narrow mobile window. Add that URL to the BLOX iframe template and verify it on a Tribune test page. The static site's CSP permits framing by `lacrossetribune.com` and its subdomains. An unrelated BLOX staging origin must be added deliberately before testing that origin.
+9. Open the actual Pages address. Check the work locations, filters, details and a narrow mobile window. Add that URL to the BLOX iframe template and verify it on a Tribune test page. The static site's CSP permits framing by `lacrossetribune.com` and its subdomains. An unrelated BLOX staging origin must be added deliberately before testing that origin.
 
 Do not share passwords or the API token in chat. Account and namespace IDs, project names, workflow success/failure codes and the public Pages URL can be used for setup troubleshooting.
 
 ## Daily behavior
 
-- The schedule is **7:17 a.m. America/Chicago**, including daylight saving changes. GitHub may delay or occasionally drop a scheduled run. **Run workflow** provides a manual retry. This workflow does the actual import.
+- The schedule is **5:17 a.m. America/Chicago**, including daylight saving changes. GitHub may delay or occasionally drop a scheduled run. **Run workflow** provides a manual retry. This workflow does the actual import.
 - One production workflow is the only writer. Concurrency queues overlapping runs and never cancels one halfway through publication. Do not enable another repository's scheduler against the same namespace/project. KV is eventually consistent and supplies no transactional lock or compare-and-swap guarantee.
 - The job lists `uploads/` using cursor pagination, verifies each metadata identity and downloaded byte hash, parses only new sources (or reparses after a parser-version change), and holds the whole changed batch if a report fails validation. Sources less than 90 seconds old hold the batch for a later retry. A source not yet visible globally may wait until the next daily scan.
 - The job deploys exactly `index.html`, curated `permits.json` and `_headers`. It verifies that the production URL serves the exact new JSON before saving `state:current` and then `control:status` in private KV. No raw report is written to the runner's disk. A failed import or deployment preserves the previous public data. If deployment succeeds but verification or a later private state write fails, the new site may already be live; the job does not acknowledge unverified publication and can safely retry.
@@ -56,14 +56,14 @@ Do not share passwords or the API token in chat. Account and namespace IDs, proj
 
 ## If a report is rejected
 
-The upload page shows a short review message. Download the original privately and check the format. Parser 1.3.0 supports the verified modern 20-column M5 New Permit Report and older 21-column M5 Permit Report layouts. Both require detail and summary reconciliation. Older reports without department/status leave those fields empty and disclose their absence. Recognizable email/telephone tokens are removed from owner, contractor, company and description fields; unexpected contact material in other fields still stops publication. Source originals remain private.
+The upload page shows a short review message. Download the original privately and check the format. Parser 1.4.0 supports the verified modern 20-column M5 New Permit Report and older 21-column M5 Permit Report layouts. Both require detail and summary reconciliation. Older reports without department/status leave those fields empty and disclose their absence. Recognizable email/telephone tokens are removed from owner, contractor, company and description fields; unexpected contact material in other fields still stops publication. Source originals remain private.
 
 Marriage-license rows in a recognized report are excluded after source totals reconcile. Image-only marriage lists are unsupported and remain Needs review until removed. Signed-in staff can click Delete beside a Needs review file and confirm to erase its private original and remove it from future imports. Published files are protected. A minimal removal marker prevents stale listings or an identical filename/content reupload from ingesting the deleted file. Install the matching Worker and publisher updates, delete between workflow runs, wait about a minute for KV propagation, then start a fresh Run workflow on main. This does not retract previously published permits.
 
 
 ## Verification
 
-`python -m unittest discover -s tests -p test_publisher.py -v` runs synthetic import/transport tests without accounts or credentials. The original-report integration test runs only when the two private originals exist in a sibling `source` folder; those files are not distributed. In this authoring environment, the publisher tests passed with the originals: 41 records and the county totals reconciled. Separate DOM-model reader checks cover setup status, daily freshness, search, filters and export. Native browser rendering, real API tokens, Wrangler deployment, scheduled execution and BLOX embedding still need the owner-led live setup above.
+`python -m unittest discover -s tests -p test_publisher.py -v` runs synthetic import/transport tests without accounts or credentials. The original-report integration test runs only when the two private originals exist in a sibling `source` folder; those files are not distributed. In this authoring environment, the publisher tests passed with the originals: 41 records and the county totals reconciled. Separate DOM-model reader checks cover setup status, daily freshness, search and filters. Native browser rendering, real API tokens, Wrangler deployment, scheduled execution and BLOX embedding still need the owner-led live setup above.
 
 ## Primary documentation
 
@@ -77,3 +77,11 @@ Marriage-license rows in a recognized report are excluded after source totals re
 - API tokens: https://developers.cloudflare.com/fundamentals/api/get-started/create-token/
 
 Provider documentation checked Nov. 9-10, 2026. No real account credentials appear in this package.
+
+## Parser 1.4 maintenance update
+
+The supported header schemas and their explicit aliases are stored in `config/report-schemas.json`. The Worker builder embeds the city schema into its single deployable script, and Python reads the same definitions. Permit Number and Permit No. are approved aliases of the CSV PermitNumber column; Permit No. is an approved label alias in either county layout. Column order and geometry remain checked. Duplicate, missing, moved and unknown columns remain errors.
+
+The municipality map is a reviewed snapshot in `config/municipalities.json`, with its original Nov. 9, 2026 review date and source URL. It is not refreshed automatically. Reconciliation still runs before marriage exclusions. The parser retains legacy contractor names only from the separate Contractor column when a value is a single line containing letters and approved name punctuation; multiline, numeric and contact-bearing values remain omitted. Modern mixed contractor blocks remain omitted.
+
+The maintenance baseline compared 48 local documents (43 accepted, five rejected). Stage-one refactoring changed no parsed results. Stage two recovered four contractor names in four reports; every other parsed value and all control totals stayed identical. Source reports are not included in the deployment package. A parser version change causes archived accepted reports to be reparsed at the next import. Deploy all Python modules plus both JSON configs together, and install the updated upload Worker to enable matching header aliases. Public-page removals and the earliest issue date remain in the packaged HTML.

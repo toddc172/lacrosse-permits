@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "county": "La Crosse",
+  "source_url": "https://www.revenue.wi.gov/Pages/UST/parcels.aspx",
+  "last_reviewed": "2026-11-09",
+  "derivation": "Work parcel prefix; never owner mailing or contractor address",
+  "prefixes": {
+    "1": "Town of Bangor",
+    "2": "Town of Barre",
+    "3": "Town of Burns",
+    "4": "Town of Campbell",
+    "5": "Town of Farmington",
+    "6": "Town of Greenfield",
+    "7": "Town of Hamilton",
+    "8": "Town of Holland",
+    "9": "Town of Medary",
+    "10": "Town of Onalaska",
+    "11": "Town of Shelby",
+    "12": "Town of Washington",
+    "13": "Village of Bangor",
+    "14": "Village of Holmen",
+    "15": "Village of Rockland",
+    "16": "Village of West Salem",
+    "17": "City of La Crosse",
+    "18": "City of Onalaska"
+  }
+}

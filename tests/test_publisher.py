@@ -288,7 +288,7 @@ class Response(io.BytesIO):
 
 
 class CountyVariantTests(unittest.TestCase):
-    def synthetic_county(self, number='4', kind='Sign Permit', work='06-00171-005 / N1936 TEST RD', department='Zoning Department'):
+    def synthetic_county(self, number='4', kind='Sign Permit', work='06-00171-005 / N1936 TEST RD', department='Zoning Department', number_header='Permit Number'):
         row = [department, '10/1/2026', '10/2/2026', number, kind, 'Issued',
                'TEST OWNER\n123 MAILING ST', work, '', '', '', 'TEST WORK',
                '', '$0.00', '', '', '', '', '', '']
@@ -300,6 +300,7 @@ class CountyVariantTests(unittest.TestCase):
              ['Type', 'Count', 'Fees', 'Cost Of Construction', 'Sq Feet'],
              [kind, '1', '$0.00', '$0.00', '0'],
              ['Total:', '1', '$0.00', '$0.00', '0']]]
+        tables[0][0][3] = number_header
         found = [SimpleNamespace(extract=lambda t=t: t, bbox=(0, 0, 20, 10),
                  rows=[SimpleNamespace(cells=[(i, 0, i+1, 1) for i in range(20)])]) for t in tables]
         page = SimpleNamespace(extract_text=lambda: 'La Crosse County M5 New Permit Report From 10/1/2026 To 10/5/2026',
@@ -307,7 +308,7 @@ class CountyVariantTests(unittest.TestCase):
         doc = SimpleNamespace(pages=[page])
         context = unittest.mock.MagicMock()
         context.__enter__.return_value = doc
-        with patch('permit_data.remove_clipped_header_wrappers', return_value=(b'test', 0)), patch('permit_data.pdfplumber.open', return_value=context):
+        with patch('permit_county.remove_clipped_header_wrappers', return_value=(b'test', 0)), patch('permit_county.pdfplumber.open', return_value=context):
             return parse_county_pdf(b'test', 'synthetic.pdf')['records'][0]
 
     def test_legacy_identifiers_are_preserved_and_normalized_for_matching(self):
@@ -332,6 +333,11 @@ class CountyVariantTests(unittest.TestCase):
         self.assertTrue(row['notes'])
         missing = self.synthetic_county(work='')
         self.assertEqual(missing['municipality'], 'Not reported')
+
+    def test_pdf_header_alias_preserves_extracted_record_and_reconciliation(self):
+        self.assertEqual(self.synthetic_county(number_header='Permit No.'), self.synthetic_county())
+        with self.assertRaises(ValidationError):
+            self.synthetic_county(number_header='Permit identifier unknown')
 
     def test_other_report_departments_are_explicit_and_unknown_departments_fail(self):
         row = self.synthetic_county(number='2026035', kind='Well Permit', department='Health Department')
@@ -552,6 +558,62 @@ class TransportTests(unittest.TestCase):
         self.assertIn('http_403', output.getvalue())
         self.assertNotIn('PRIVATE_RESPONSE', output.getvalue())
         self.assertEqual(pauses, [5, 10, 20, 30, 30])
+
+
+class MaintenanceTests(unittest.TestCase):
+    def test_explicit_csv_aliases_preserve_every_record(self):
+        expected = parse_report(city(), 'weekly.csv')
+        for label in ('Permit Number', 'Permit No.'):
+            with self.subTest(label=label):
+                result = parse_report(city().replace(b'PermitNumber', label.encode()), 'weekly.csv')
+                self.assertEqual(result['records'], expected['records'])
+                self.assertEqual(result['controls'], expected['controls'])
+
+    def test_unknown_duplicate_and_moved_headers_are_rejected(self):
+        for raw in (city().replace(b'PermitNumber', b'Permit ID'),
+                    city().replace(b'PermitType', b'PermitNumber'),
+                    city().replace(b'PermitNumber,PermitType', b'PermitType,PermitNumber')):
+            with self.subTest(header=raw.splitlines()[0]):
+                with self.assertRaises(ValidationError):
+                    parse_report(raw, 'weekly.csv')
+
+    def test_pdf_aliases_preserve_positional_schemas(self):
+        from permit_schemas import canonical_headers, LEGACY_PDF_FIELDS
+        for schema, fields in [('county-modern-v1', PDF_FIELDS), ('county-legacy-v1', LEGACY_PDF_FIELDS)]:
+            variant = list(fields)
+            variant[variant.index('Permit Number')] = 'Permit No.'
+            self.assertEqual(canonical_headers(variant, schema), fields)
+            variant[0] = 'Unknown column'
+            with self.assertRaises(ValidationError):
+                canonical_headers(variant, schema)
+
+    def test_only_names_in_separate_contractor_field_are_recovered(self):
+        from permit_policy import separated_contractor_name
+        self.assertEqual(separated_contractor_name("TEST BUILDERS LLC"), 'TEST BUILDERS LLC')
+        for value in ('TEST BUILDER\n123 TEST ST', '123 TEST ST', 'TEST 608-555-0100',
+                      'TEST <private@email.test>', 'P.O. BOX', 'None', 'TEST\nBUILDER'):
+            with self.subTest(value=value):
+                self.assertIsNone(separated_contractor_name(value))
+
+    def test_legacy_contractor_address_and_phone_never_enter_public_record(self):
+        from permit_county import county_record
+        modern = ['', '10/1/2026', '10/2/2026', '7', 'Sign Permit', '',
+                  'TEST OWNER', '06-00171-005 / N1936 TEST RD', '', '',
+                  'PRIVATE MIXED CONTACT', 'TEST WORK', '$0.00', '$0.00', '', '', '', '', '', '']
+        legacy = county_record({'cells': modern, 'pages': [1], 'contractor_name': 'TEST BUILDERS LLC'},
+                               '2026-10-01', '2026-10-05', 'legacy.pdf', legacy=True)
+        self.assertEqual(legacy['contractor'], 'TEST BUILDERS LLC')
+        modern[0], modern[5] = 'Zoning Department', 'Issued'
+        record = county_record({'cells': modern, 'pages': [1], 'contractor_name': 'TEST BUILDERS LLC'},
+                               '2026-10-01', '2026-10-05', 'modern.pdf')
+        self.assertIsNone(record['contractor'])
+        self.assertNotIn('PRIVATE MIXED', json.dumps(record))
+
+    def test_municipality_config_provenance_is_explicit(self):
+        config = json.loads((ROOT / 'config/municipalities.json').read_text())
+        self.assertEqual(config['prefixes']['17'], 'City of La Crosse')
+        self.assertEqual(config['last_reviewed'], '2026-11-09')
+        self.assertTrue(config['source_url'].startswith('https://www.revenue.wi.gov/'))
 
 
 if __name__ == "__main__":
