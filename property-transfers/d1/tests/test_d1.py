@@ -14,9 +14,8 @@ D1ROOT=Path(__file__).resolve().parents[1];ROOT=D1ROOT.parent
 sys.path.insert(0,str(ROOT));sys.path.insert(0,str(D1ROOT))
 from sync_d1 import import_month,synchronize,BudgetPause,clean_removed_staging,D1,run_batches
 from cloudflare_client import ServiceError
-from transfer_data import parse_report,public_dataset,PARSER_VERSION
-from deploy_reader import write_reader,api_origin
-helpers=runpy.run_path(str(ROOT/'tests/test_transfers.py'))
+from transfer_data import parse_report
+helpers=runpy.run_path(str(ROOT/'tests/fixtures.py'))
 source=helpers['source'];API=helpers['API']
 NOW='2026-11-13T22:00:00Z'
 
@@ -62,11 +61,7 @@ class Tests(unittest.TestCase):
         meta,records,_=entry();import_month(self.db,meta,records,NOW);m2,r2,_=entry('2026-08')
         with self.assertRaises(ServiceError):import_month(self.db,m2,r2,NOW)
         self.assertEqual(self.db.meta()['source_count'],1)
-    def test_pilot_leaves_upload_status_and_state_untouched(self):
-        meta,records,api=entry();parsed=parse_report(api.values['uploads/'+meta['id']],meta['name'])
-        old={'schema_version':1,'files':{meta['id']:{'metadata':meta,'modified':meta['uploaded_at'],'parser_version':PARSER_VERSION,'records':records,'controls':parsed['controls']}},'public':None}
-        api.values['state:current']=old;before=copy.deepcopy(api.values)
-        self.assertEqual(synchronize(api,self.db,now=NOW),1);self.assertEqual(api.values,before)
+
     def test_production_status_preserves_published_protection(self):
         meta,records,api=entry();synchronize(api,self.db,mode='production',now=NOW)
         self.assertEqual(api.values['control:status']['files'][meta['id']]['state'],'published')
@@ -82,13 +77,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(self.db.query(results[3]['sql'],results[3]['bind'])),0)
         self.assertEqual(len(self.db.query(results[4]['sql'],results[4]['bind'])),0)
         for r in results[5:]:self.assertIn('error',r)
-    def test_preview_cutover_assets_are_allowlisted(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as temp:
-            write_reader(temp,'https://example.owner.workers.dev')
-            self.assertEqual({p.name for p in Path(temp).iterdir()},{'index.html','_headers','d1-config.json'})
-            self.assertIn('https://example.owner.workers.dev',(Path(temp)/'_headers').read_text())
-        with self.assertRaises(ServiceError):api_origin('http://not-https.example')
+
     def test_keyset_pagination_for_every_sort(self):
         meta,records,_=entry();base=records[0];rows=[]
         for i in range(61):
@@ -122,25 +111,7 @@ class Tests(unittest.TestCase):
         meta,records,api=entry();import_month(self.db,meta,records,NOW)
         api.values['removed/'+meta['id']]={'schema_version':1,'id':meta['id']};clean_removed_staging(api,self.db)
         self.assertEqual(self.db.meta()['record_count'],1);self.assertEqual(self.db.query('SELECT count(*) n FROM transfers')[0]['n'],1)
-    def test_test_reader_deployment_and_verification(self):
-        import deploy_reader
-        import types
-        meta,records,_=entry();import_month(self.db,meta,records,NOW)
-        origin='https://test.owner.workers.dev';holder={}
-        class Adapter:
-            account='a'*32;token='fake-test-token'
-            def project(self,name):return {'name':'reader','hostname':'reader.pages.dev','branch':'main'}
-        def public(url):return self.db.meta() if url.endswith('/metadata') else {'mode':'d1','api_base':origin}
-        def deploy(argv,**kwargs):holder['html']=(Path(kwargs['cwd'])/'index.html').read_bytes();return types.SimpleNamespace(returncode=0)
-        class Response:
-            headers={}
-            def __enter__(self):return self
-            def __exit__(self,*args):pass
-            def read(self,n):return holder['html']
-        opener=types.SimpleNamespace(open=lambda *args,**kwargs:Response())
-        with patch.dict('os.environ',{'GITHUB_ACTIONS':'true','TRANSFERS_PUBLIC_REPOSITORY':'true','TRANSFERS_D1_API_URL':origin}),patch.object(deploy_reader,'Cloudflare',lambda *args:Adapter()),patch.object(deploy_reader,'D1',lambda *args:self.db),patch.object(deploy_reader,'read_public',public),patch.object(deploy_reader.subprocess,'run',deploy),patch.object(deploy_reader,'build_opener',lambda *args:opener):
-            deploy_reader.main()
-        self.assertIn(origin.encode(),holder['html']);self.assertNotIn(b'fake-test-token',holder['html'])
+
     def test_rest_batch_contract_and_usage_pause(self):
         client=D1('a'*32,'11111111-1111-1111-1111-111111111111','fake-token')
         captured=[]
@@ -160,26 +131,70 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(captured),1)
     def test_until_budget_runs_successive_batches(self):
         with patch('sync_d1.synchronize',side_effect=[3,3,2]) as sync:
-            self.assertEqual(run_batches(None,None,'pilot',3,True),8)
+            self.assertEqual(run_batches(None,None,'production',3,True),8)
             self.assertEqual(sync.call_count,3)
     def test_until_budget_stops_immediately_at_safeguard(self):
         with patch('sync_d1.synchronize',side_effect=[3,BudgetPause()]) as sync:
-            with self.assertRaises(BudgetPause):run_batches(None,None,'pilot',3,True)
+            with self.assertRaises(BudgetPause):run_batches(None,None,'production',3,True)
             self.assertEqual(sync.call_count,2)
     def test_manual_single_batch_remains_supported(self):
         with patch('sync_d1.synchronize',return_value=3) as sync:
-            self.assertEqual(run_batches(None,None,'pilot',3,False),3)
+            self.assertEqual(run_batches(None,None,'production',3,False),3)
             self.assertEqual(sync.call_count,1)
-    def test_completed_automatic_migration_is_not_repeated(self):
+
+
+    def test_production_has_no_legacy_state_dependency(self):
         import sync_d1
-        meta,records,api=entry();api.account='a'*32
-        parsed=parse_report(api.values['uploads/'+meta['id']],meta['name'])
-        api.values['state:current']={'schema_version':1,'files':{meta['id']:{'metadata':meta,'modified':meta['uploaded_at'],'parser_version':PARSER_VERSION,'records':records,'controls':parsed['controls']}},'public':None}
+        meta,records,api=entry()
+        original=api.values['uploads/'+meta['id']]
+        api.account='a'*32
+        api.values['state:current']={'retired':'must remain untouched'}
+        api.values['d1:migration:complete']={'retired':'must remain untouched'}
+        read=api.get_json
+        def guarded(key):
+            if key in {'state:current','d1:migration:complete'}:raise AssertionError('Retired state must not be read')
+            return read(key)
+        api.get_json=guarded
         self.db.usage={'rows_read':0,'rows_written':0}
-        with patch.dict('os.environ',{'GITHUB_ACTIONS':'true','TRANSFERS_PUBLIC_REPOSITORY':'true','TRANSFERS_D1_DATABASE_ID':'11111111-1111-1111-1111-111111111111'}),patch.object(sync_d1,'Cloudflare',lambda *args:api),patch.object(sync_d1,'D1',lambda *args:self.db),patch.object(sys,'argv',['sync_d1.py','--mode','pilot','--audit','--until-budget']):
+        with patch.dict('os.environ',{'GITHUB_ACTIONS':'true','TRANSFERS_PUBLIC_REPOSITORY':'true','TRANSFERS_D1_DATABASE_ID':'11111111-1111-1111-1111-111111111111'}),patch.object(sync_d1,'Cloudflare',lambda *args:api),patch.object(sync_d1,'D1',lambda *args:self.db),patch.object(sys,'argv',['sync_d1.py']):
             self.assertEqual(sync_d1.main(),0)
-            self.assertIn('d1:migration:complete',api.values)
-            with patch.object(sync_d1,'run_batches',side_effect=AssertionError('Completed baseline must not reimport')):
-                self.assertEqual(sync_d1.main(),0)
+            self.assertEqual(sync_d1.main(),0)
+        self.assertEqual(self.db.meta()['record_count'],1)
+        self.assertEqual(api.values['uploads/'+meta['id']],original)
+        self.assertEqual(api.values['state:current'],{'retired':'must remain untouched'})
+        self.assertEqual(api.values['d1:migration:complete'],{'retired':'must remain untouched'})
+        self.assertEqual(api.values['control:status']['files'][meta['id']]['state'],'published')
+        self.assertEqual(len([k for k in api.values if k.startswith('d1:usage:')]),1)
+
+    def test_failed_source_is_reported_and_later_file_is_not_imported(self):
+        api=API()
+        broken=api.add('2026-08',gzip.compress(b'wrong headers\n'))
+        later=api.add('2026-09',source())
+        originals=copy.deepcopy(api.values)
+        with self.assertRaises(ValueError):synchronize(api,self.db,now=NOW)
+        self.assertEqual(self.db.meta()['record_count'],0)
+        status=api.values['control:status']['files']
+        self.assertEqual(status[broken]['state'],'rejected')
+        self.assertEqual(status[later]['state'],'stored')
+        for key,value in originals.items():self.assertEqual(api.values[key],value)
+
+    def test_budget_pause_keeps_source_and_reports_stored(self):
+        meta,records,api=entry();self.db.pause=True
+        original=api.values['uploads/'+meta['id']]
+        with self.assertRaises(BudgetPause):synchronize(api,self.db,now=NOW)
+        self.assertEqual(api.values['control:status']['files'][meta['id']]['state'],'stored')
+        self.assertEqual(api.values['uploads/'+meta['id']],original)
+        self.assertEqual(self.db.meta()['record_count'],0)
+        self.db.pause=False
+        self.assertEqual(synchronize(api,self.db,now=NOW),1)
+        self.assertEqual(self.db.meta()['record_count'],1)
+
+    def test_retired_pilot_command_is_rejected_before_any_network_access(self):
+        import sync_d1
+        import contextlib
+        import io
+        with patch.object(sys,'argv',['sync_d1.py','--mode','pilot']),patch.object(sync_d1,'Cloudflare',side_effect=AssertionError('No client expected')),contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:sync_d1.main()
+        self.assertEqual(error.exception.code,2)
 
 if __name__=='__main__':unittest.main()

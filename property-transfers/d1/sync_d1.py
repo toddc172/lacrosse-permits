@@ -1,5 +1,6 @@
-"""Incremental KV -> D1 importer. Default is a pilot of already-published files.
-No production Pages deployment and no original deletion occurs in this tool.
+"""Production KV -> D1 importer. Retains originals and resumes staged months.
+
+Public search uses the existing Worker; this command does not deploy readers.
 """
 import argparse
 import datetime as dt
@@ -16,7 +17,7 @@ from urllib.error import HTTPError, URLError
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 from cloudflare_client import Cloudflare, NoRedirect, ServiceError, json_bytes
-from publish_transfers import read_state, upload_metadata, utc, MAX_SOURCE, status_record
+from upload_contract import upload_metadata, utc, MAX_SOURCE, status_record
 from transfer_data import parse_report, validate_unique
 
 class BudgetPause(Exception): pass
@@ -113,66 +114,45 @@ def clean_removed_staging(api,db):
             db.query("DELETE FROM transfers WHERE rowid IN (SELECT t.rowid FROM transfers t JOIN batches b ON b.id=t.batch_id WHERE t.batch_id=? AND b.status='staging' LIMIT 50)",[ident])
         db.query("DELETE FROM batches WHERE id=? AND status='staging'",[ident])
 
-def synchronize(api,db,mode='pilot',max_months=3,now=None):
+def synchronize(api,db,mode='production',max_months=3,now=None):
+    if mode!='production':raise ServiceError('production_mode_required')
     now=now or dt.datetime.now(dt.timezone.utc).isoformat();clock=utc(now)
     clean_removed_staging(api,db)
     accepted={r['id']:r for r in db.query("SELECT id,metadata_json FROM batches WHERE status='active'")}
-    if mode=='pilot':
-        old=read_state(api)
-        sources=[(entry['metadata'],entry['records']) for entry in old['files'].values()]
-        print(f'Pilot baseline: {len(sources)} published sources and {sum(len(rows) for _,rows in sources)} records.')
-    else:
-        sources=[]
-        for item in api.list_uploads():
-            meta=upload_metadata(item)
-            if meta['id'] in accepted:continue
-            if api.get_json('removed/'+meta['id']) is not None:continue
-            sources.append((meta,None))
-    count=0;issues={};uploaded={meta['id']:meta for meta,_ in sources}
-    for meta,cached in sorted(sources,key=lambda item:item[0]['name']):
+    sources=[]
+    for item in api.list_uploads():
+        meta=upload_metadata(item)
+        if meta['id'] in accepted:continue
+        if api.get_json('removed/'+meta['id']) is not None:continue
+        sources.append(meta)
+    count=0;issues={};uploaded={meta['id']:meta for meta in sources}
+    for meta in sorted(sources,key=lambda item:item['name']):
         ident=meta['id']
         if ident in accepted:continue
         if count>=max_months:break
         if (clock-utc(meta['uploaded_at'])).total_seconds()<90:
             issues[ident]='Waiting for a later publishing run after this recent upload.';continue
         try:
-            if cached is None:
-                raw=api.get_value('uploads/'+ident,limit=MAX_SOURCE)
-                if len(raw)!=meta['bytes'] or hashlib.sha256(raw).hexdigest()!=meta['sha256']:raise ServiceError('source_content_hash_mismatch')
-                records=parse_report(raw,meta['name'])['records']
-            else:records=cached
+            raw=api.get_value('uploads/'+ident,limit=MAX_SOURCE)
+            if len(raw)!=meta['bytes'] or hashlib.sha256(raw).hexdigest()!=meta['sha256']:raise ServiceError('source_content_hash_mismatch')
+            records=parse_report(raw,meta['name'])['records']
             if import_month(db,meta,records,now):
                 count+=1
                 print(f'Activated {meta["name"]}: {len(records)} records.')
             accepted[ident]={'id':ident,'metadata_json':json_bytes(meta).decode()}
         except Exception as error:
-            if mode=='production':
-                bad=isinstance(error,ValueError) or (isinstance(error,ServiceError) and error.code in {'d1_month_conflict_review_required','d1_document_conflict_review_required','d1_staged_content_conflict','d1_batch_reconciliation_failed'})
-                status=status_record({'files':accepted,'public':bool(accepted)},uploaded,now)
-                status['files'][ident]={'state':'rejected' if bad else 'stored','message':
-                    'This source needs editorial review. Previously accepted records remain available.' if bad else
-                    'The D1 import paused or was interrupted. Staged rows remain private; check the workflow before retrying.'}
-                api.put_json('control:status',status)
+            bad=isinstance(error,ValueError) or (isinstance(error,ServiceError) and error.code in {'d1_month_conflict_review_required','d1_document_conflict_review_required','d1_staged_content_conflict','d1_batch_reconciliation_failed'})
+            status=status_record({'files':accepted,'public':bool(accepted)},uploaded,now)
+            status['files'][ident]={'state':'rejected' if bad else 'stored','message':
+                'This source needs editorial review. Previously accepted records remain available.' if bad else
+                'The D1 import paused or was interrupted. Staged rows remain private; check the workflow before retrying.'}
+            api.put_json('control:status',status)
             # Fail closed: never skip a failed file silently and declare success.
             raise
-    if mode=='production':
-        status=status_record({'files':accepted,'public':bool(accepted)},uploaded,now)
-        for ident,message in issues.items():status['files'][ident]={'state':'stored','message':message}
-        api.put_json('control:status',status)
+    status=status_record({'files':accepted,'public':bool(accepted)},uploaded,now)
+    for ident,message in issues.items():status['files'][ident]={'state':'stored','message':message}
+    api.put_json('control:status',status)
     return count
-
-def audit_pilot(api,db):
-    old=read_state(api);active={r['id']:r for r in db.query("SELECT id,record_hash,expected_count FROM batches WHERE status='active'")}
-    expected=0;missing=0
-    for ident,entry in old['files'].items():
-        rows=entry['records'];expected+=len(rows)
-        if ident not in active:missing+=1;continue
-        fingerprint=digest([[r['id'],digest(r)] for r in sorted(rows,key=lambda r:r['id'])])
-        if active[ident]['record_hash']!=fingerprint or active[ident]['expected_count']!=len(rows):raise ServiceError('pilot_source_reconciliation_failed')
-    summary=json.loads(db.query("SELECT value FROM settings WHERE name='public'")[0]['value'])
-    print(f'Pilot audit: expected {expected} static-published records; D1 has {summary["record_count"]}. Missing source months: {missing}.')
-    if not missing and (set(active)!=set(old['files']) or summary['record_count']!=expected):raise ServiceError('pilot_total_reconciliation_failed')
-    return not missing
 
 def report_coverage(db):
     summary=json.loads(db.query("SELECT value FROM settings WHERE name='public'")[0]['value'])
@@ -195,7 +175,7 @@ def run_batches(api,db,mode,max_months,until_budget):
         if not until_budget or count<max_months:return total
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--mode',choices=['pilot','production'],default='pilot');parser.add_argument('--max-months',type=int,default=3);parser.add_argument('--init',action='store_true');parser.add_argument('--audit',action='store_true');parser.add_argument('--until-budget',action='store_true');args=parser.parse_args()
+    parser=argparse.ArgumentParser();parser.add_argument('--mode',choices=['production'],default='production');parser.add_argument('--max-months',type=int,default=3);parser.add_argument('--init',action='store_true');parser.add_argument('--until-budget',action='store_true');args=parser.parse_args()
     if not 1<=args.max_months<=12:parser.error('max-months must be 1 to 12')
     if os.environ.get('GITHUB_ACTIONS')!='true' or os.environ.get('TRANSFERS_PUBLIC_REPOSITORY')!='true':raise ServiceError('run_only_in_public_repository_workflow')
     api=Cloudflare(os.environ.get('CLOUDFLARE_ACCOUNT_ID',''),os.environ.get('CLOUDFLARE_KV_NAMESPACE_ID',''),os.environ.get('CLOUDFLARE_API_TOKEN',''))
@@ -203,24 +183,7 @@ def main():
     db=D1(api.account,os.environ.get('TRANSFERS_D1_DATABASE_ID',''),os.environ.get('TRANSFERS_D1_API_TOKEN',''),usage)
     try:
         if args.init:db.query(Path(__file__).with_name('schema.sql').read_text())
-        baseline=None;completion_key='d1:migration:complete'
-        if args.mode=='pilot' and args.audit:
-            source_state=api.get_json('state:current')
-            if not isinstance(source_state,dict) or not isinstance(source_state.get('files'),dict):raise ServiceError('pilot_baseline_unavailable')
-            baseline=digest(source_state['files'])
-            completed=api.get_json(completion_key)
-            if (isinstance(completed,dict) and completed.get('database_id')==os.environ.get('TRANSFERS_D1_DATABASE_ID') and completed.get('baseline_fingerprint')==baseline):
-                summary=json.loads(db.query("SELECT value FROM settings WHERE name='public'")[0]['value'])
-                if summary.get('revision')==completed.get('revision'):
-                    print('Pilot migration already reconciled completely. No further import work is needed for this baseline.');return 0
         count=run_batches(api,db,args.mode,args.max_months,args.until_budget)
-        if args.audit:
-            if args.mode!='pilot':raise ServiceError('audit_is_for_pilot_only')
-            complete=audit_pilot(api,db)
-            if complete:
-                summary=json.loads(db.query("SELECT value FROM settings WHERE name='public'")[0]['value'])
-                api.put_json(completion_key,{'schema_version':1,'database_id':os.environ.get('TRANSFERS_D1_DATABASE_ID'),'baseline_fingerprint':baseline,'revision':summary['revision'],'completed_at':dt.datetime.now(dt.timezone.utc).isoformat()})
-                print('Pilot migration COMPLETE: every baseline source reconciled. Future pilot runs will skip this unchanged baseline.')
         report_coverage(db)
         print(f'D1 {args.mode}: activated {count} source months. Import usage: {db.usage["rows_read"]} rows read; {db.usage["rows_written"]} rows written today.')
     except BudgetPause:
