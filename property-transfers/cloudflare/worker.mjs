@@ -51,12 +51,10 @@ export default {async fetch(request,env) {
       const metadata={schema_version:1,id,name,bytes:raw.length,sha256,uploaded_at:new Date().toISOString(),media_type:'text/csv'};
       await env.FILES.put(key,raw,{metadata});return send({ok:true});
     }
+    // Retain originals while D1 publication and uploader status are separate.
+    // Old browser tabs may still show a removal button; block the request here.
     if(url.pathname==='/delete' && request.method==='POST'){
-      const body=JSON.parse(new TextDecoder().decode(await limited(request,1024)));
-      if(!/^[a-f0-9]{64}$/.test(body.id||''))return send({error:'Invalid file.'},400);
-      const status=await env.FILES.get('control:status','json');const state=await env.FILES.get('state:current','json');
-      if(state?.files?.[body.id] || status?.files?.[body.id]?.state!=='rejected')return send({error:'Only never-published, rejected files can be removed.'},409);
-      await env.FILES.put('removed/'+body.id,JSON.stringify({schema_version:1,id:body.id}));await env.FILES.delete('uploads/'+body.id);return send({ok:true});
+      return send({error:'File removal is disabled. Uploaded source files are retained; ask the editor to review rejected files.'},403);
     }
     return send({error:'Not found.'},404);
   }catch{return send({error:'The request could not be completed. Check file size and retry.'},400);}
