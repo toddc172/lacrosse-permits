@@ -1,5 +1,31 @@
 # Permit parser maintenance
 
+## Required permits uploader headline
+
+The permits staff upload site must use this exact visible headline:
+
+**Newsroom building and zoning permit uploads**
+
+The former wording, `Newsroom report uploads`, is retired. Preserve the approved
+wording in the uploader HTML source, any page-title wording that repeats it, and
+all generated or standalone Worker bundles. Rebuilding or deploying must not
+restore the retired headline. Check the final deployed page after each update.
+This requirement applies to the permits uploader, not the property transfers
+uploader or either public database heading.
+
+The Nov. 24, 2026 PAGE_HTML attachment is archived as
+`cloudflare/permit-upload-page.html`. It already contains the correct headline
+and browser title. `cloudflare/build_permit_upload_page.py` validates that wording
+and generates `cloudflare/permit-upload-page.constant.js`. Run it with `--check`
+to verify the saved artifact, or `--check-worker PATH` to check that a candidate
+replacement embeds the maintained template. Rebuild all upstream templates that
+supply PAGE_HTML from this source; older external packages are not authoritative.
+
+Only the PAGE_HTML constant was supplied. The full permits Worker request
+handler, backend and any external generator remain unavailable. Do not deploy
+the page constant alone as a Worker. Keep the working Cloudflare backend until
+its complete current source is saved and reviewed.
+
 ## Module boundaries
 
 - `permit_data.py`: stable import entry points and parser version.
